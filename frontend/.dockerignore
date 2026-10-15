@@ -1,0 +1,31 @@
+# Zaleznosci instalowane lokalnie
+node_modules
+
+# Wyniki lokalnego budowania Next.js
+.next
+out
+build
+
+# Lokalne zmienne srodowiskowe i sekrety
+.env
+.env.*
+!.env.example
+
+# Git
+.git
+.gitignore
+
+# Logi
+*.log
+npm-debug.log*
+
+# Pliki edytora
+.vscode
+.idea
+
+# Pliki systemowe
+.DS_Store
+Thumbs.db
+
+# Cache TypeScript
+*.tsbuildinfo

@@ -1,0 +1,104 @@
+@baseUrl = http://localhost:8080
+@email = rafal.test@example.com
+@password = Password123!
+
+@email2 = b.test@example.com
+@password2 = Password123B!
+
+
+### 1. Register - rejestracja użytkownika
+POST {{baseUrl}}/api/auth/register
+Content-Type: application/json
+
+{
+  "email": "{{email}}",
+  "firstName": "Jan",
+  "lastName": "Kowalski",
+  "password": "{{password}}"
+}
+
+### 2. Verivy email
+GET http://localhost:8080/api/auth/verify-email?token={{verificationToken}}
+
+
+### 3. Login - logowanie użytkownika
+# @name login
+POST {{baseUrl}}/api/auth/login
+Content-Type: application/json
+
+{
+  "email": "{{email}}",
+  "password": "{{password}}"
+}
+
+
+### 4. Refresh - odświeżenie access tokena
+POST {{baseUrl}}/api/auth/refresh
+Content-Type: application/json
+
+{
+  "refreshToken": "c4c7eafc-cadd-4cd9-bd63-e95b51308726.01ba1d2b-b033-483a-bc8e-228e687265ea"
+}
+
+
+### 1. Register - rejestracja użytkownika - uzytkownik B
+POST {{baseUrl}}/api/auth/register
+Content-Type: application/json
+
+{
+  "email": "{{email2}}",
+  "firstName": "Paweł",
+  "lastName": "B",
+  "password": "{{password2}}"
+}
+
+
+### 2. Verivy email for B
+GET http://localhost:8080/api/auth/verify-email?token={{verificationToken}}
+
+
+### 3. Login - logowanie użytkownika
+# @name login
+POST {{baseUrl}}/api/auth/login
+Content-Type: application/json
+
+{
+  "email": "{{email2}}",
+  "password": "{{password2}}"
+}
+
+###TEST UPLOADU
+### Login
+POST http://localhost:8080/api/auth/login
+Content-Type: application/json
+
+{
+  "email": "rafal.test@example.com",
+  "password": "Password123!"
+}
+
+> {%
+  client.global.set("accessToken", response.body.accessToken);
+%}
+
+
+### Upload document
+POST http://localhost:8080/api/documents
+Authorization: Bearer {{accessToken}}
+Content-Type: multipart/form-data; boundary=WebAppBoundary
+
+--WebAppBoundary
+Content-Disposition: form-data; name="metadata"
+Content-Type: application/json
+
+{
+  "title": "Testowy dokument urzędowy",
+  "documentTypeId": "55555555-5555-5555-5555-555555555555"
+}
+
+--WebAppBoundary
+Content-Disposition: form-data; name="file"; filename="faktura.pdf"
+Content-Type: application/pdf
+
+< ./files/Sulkowski_Rafal_WEZWANIE_na_pierwsze_spo.pdf
+--WebAppBoundary--

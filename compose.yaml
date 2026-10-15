@@ -1,0 +1,72 @@
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.6-pg18
+    environment:
+      POSTGRES_DB: ai_document_vault
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d ai_document_vault" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/ai_document_vault
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+
+      SPRING_PROFILES_ACTIVE: local
+      SPRING_CONFIG_ADDITIONAL_LOCATION: file:/config/
+
+      APP_AI_OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY is required}
+      APP_SECURITY_JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+
+      APP_STORAGE_LOCAL_BASE_PATH: /data/documents
+
+    ports:
+      - "8080:8080"
+
+    volumes:
+      - type: bind
+        source: ${CONFIG_DIR:?CONFIG_DIR is required}
+        target: /config
+        read_only: true
+
+      - type: bind
+        source: ${STORAGE_DIR:?STORAGE_DIR is required}
+        target: /data/documents
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+
+    depends_on:
+      - backend
+
+    environment:
+      NODE_ENV: production
+      BACKEND_API_URL: http://backend:8080
+      SESSION_COOKIE_SECURE: "false"
+
+    ports:
+      - "3001:3000"
+
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

@@ -1,0 +1,24 @@
+# Version control / IDE
+.git
+.idea
+.vscode
+*.iml
+
+# Local configuration and secrets
+.env
+.env.*
+src/main/resources/application-local.properties
+
+# Local Maven build output
+target/
+
+# Logs and temporary files
+logs/
+*.log
+tmp/
+temp/
+
+# Windows Maven Wrapper is not needed in the Linux Maven builder
+.mvn/
+mvnw
+mvnw.cmd
