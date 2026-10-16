@@ -1,90 +1,91 @@
-# Kubernetes — Secret Management
+# Kubernetes Secret management
 
-## Purpose
+RAG Document Assistant keeps sensitive runtime configuration outside source control. Two PowerShell scripts create or update Kubernetes Secret objects from one ignored local file.
 
-The RAG Document Assistant backend uses Kubernetes Secrets to store sensitive configuration outside the application source code.
+## Required values
 
-The backend requires three secrets:
+| Local variable | Kubernetes use |
+| --- | --- |
+| `APP_AI_OPENAI_API_KEY` | OpenAI API authentication in `backend-secret` |
+| `APP_SECURITY_JWT_SECRET` | JWT signing and validation in `backend-secret` |
+| `SPRING_DATASOURCE_PASSWORD` | Backend database authentication in `backend-secret`; mapped to `POSTGRES_PASSWORD` in `postgres-secret` |
 
-| Environment variable | Purpose |
-|---|---|
-| `APP_AI_OPENAI_API_KEY` | OpenAI API authentication |
-| `APP_SECURITY_JWT_SECRET` | JWT signing and verification |
-| `SPRING_DATASOURCE_PASSWORD` | PostgreSQL authentication |
+The JWT secret must be a sufficiently strong Base64-encoded random value. Base64 is an encoding, not encryption.
 
-## Local setup
+## Prepare the ignored file
 
-### 1. Prepare the secrets file
-
-From the repository root, run:
+From the repository root:
 
 ```powershell
 Copy-Item .\infra\k8s\backend-secret.env.example .\infra\k8s\backend-secret.env
 ```
 
-Edit `backend-secret.env` and provide real values for all three variables.
+Fill every value locally:
 
-The file must contain actual secret values, not placeholders such as `${OPENAI_API_KEY_DV}`.
+```dotenv
+SPRING_DATASOURCE_PASSWORD=<strong-local-database-password>
+APP_AI_OPENAI_API_KEY=<your-openai-api-key>
+APP_SECURITY_JWT_SECRET=<base64-encoded-random-secret>
+```
 
-The same ignored file is the single local source for both Kubernetes Secrets.
-The PostgreSQL synchronization script maps `SPRING_DATASOURCE_PASSWORD` to the
-database container's `POSTGRES_PASSWORD`, eliminating the risk of two different
-passwords being configured.
+The scripts reject missing, empty, duplicate, unexpected, or unresolved placeholder values. The local file is ignored by Git and must remain untracked.
 
-### 2. Verify the Kubernetes context
+## Verify the target
 
 ```powershell
 kubectl config current-context
+kubectl get namespace
 ```
 
-Make sure the selected cluster is the intended deployment target.
-
-### 3. Synchronize Kubernetes Secret
+Specify context and namespace explicitly when multiple clusters are configured:
 
 ```powershell
-.\infra\k8s\scripts\sync-backend-secret.ps1
+.\infra\k8s\scripts\sync-backend-secret.ps1 -KubeContext <context-name> -Namespace rag-document-assistant
+.\infra\k8s\scripts\sync-postgres-secret.ps1 -KubeContext <context-name> -Namespace rag-document-assistant
 ```
 
-The script validates the required values, displays the selected Kubernetes context and namespace, requests confirmation, and creates or updates the `backend-secret` object.
+## Confirmation behavior
 
-Synchronize the PostgreSQL Secret with the same context and namespace:
+Before changing a Secret, each script displays:
+
+- the operation;
+- Kubernetes context;
+- namespace;
+- Secret name.
+
+It then asks `Continue? (y/n)`:
+
+- `y` or `Y` applies the Secret;
+- `n` or `N` cancels;
+- Enter cancels;
+- any other answer cancels.
+
+Cancellation occurs before `kubectl apply`. The scripts never display secret values. They build generated manifests in memory, pipe them directly to `kubectl`, and clear sensitive variables in cleanup paths.
+
+## Deployment integration
+
+`backend-deployment.yaml` uses explicit `secretKeyRef` entries for backend values. `postgres-deployment.yaml` reads its database password from `postgres-secret`. Non-sensitive settings are kept separately in ConfigMaps.
+
+Kubernetes Secrets are namespace-scoped. Create them independently in every intended cluster and namespace.
+
+## After an intentional update
+
+The backend receives values as environment variables at container startup, so restart it after changing its Secret:
 
 ```powershell
-.\infra\k8s\scripts\sync-postgres-secret.ps1
+kubectl rollout restart deployment/backend -n rag-document-assistant
+kubectl rollout status deployment/backend -n rag-document-assistant --timeout=180s
 ```
 
-Both scripts keep generated Secret manifests in memory and never print the secret
-values.
-
-### 4. Restart the backend when secrets change
-
-```powershell
-kubectl rollout restart deployment/backend
-kubectl rollout status deployment/backend --timeout=120s
-```
-
-A restart is necessary because the backend receives secrets as environment variables when its container starts.
-
-## Kubernetes integration
-
-The backend Deployment uses `secretKeyRef` to explicitly reference the required keys in `backend-secret`.
-
-Non-sensitive configuration is stored separately in the `backend-config` ConfigMap.
+Changing `postgres-secret` does not update the password stored for an already initialized PostgreSQL database user. Coordinate database password rotation separately before restarting consumers.
 
 ## Security rules
 
-- Never commit `backend-secret.env` or real credentials to Git.
-- Never store real credentials in Dockerfiles or container images.
-- Never print secret values in logs or terminal output.
-- Do not use Base64 as a substitute for encryption.
-- Limit access to Kubernetes Secrets using RBAC.
-- For production environments, use encryption at rest and consider a dedicated secrets manager.
-- Rotate compromised secrets immediately.
+- Never commit `backend-secret.env`, real credentials, generated Secret YAML, or decoded Secret data.
+- Never place credentials in Dockerfiles, images, ConfigMaps, documentation, terminal transcripts, or issue reports.
+- Limit Secret and deployment access with Kubernetes RBAC.
+- Enable appropriate encryption at rest for the target cluster.
+- Rotate credentials after suspected exposure.
+- Prefer a managed secrets solution and narrowly scoped deployment identity for a production environment.
 
-## Deployment notes
-
-The PostgreSQL password supplied to the backend must match the password configured for the actual PostgreSQL database. Updating a Kubernetes Secret does not automatically change the database user's password.
-
-Kubernetes Secrets are scoped to a namespace and must be provisioned separately in each target cluster.
-
-The local script is intended for development and controlled deployments. Production deployments should use a managed secrets solution and appropriately scoped deployment credentials.
+These local scripts support development and controlled local deployment; they are not a complete production secrets-management system.

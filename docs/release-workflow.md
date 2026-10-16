@@ -1,123 +1,142 @@
-# Release workflow: PR, container publishing, and Kubernetes deployment
+# Release workflow
 
-The repository uses one PowerShell entry point for the release process:
+`scripts/release-workflow.ps1` coordinates local validation, Pull Request submission, GitHub release creation, GHCR publication checks, and deployment to a selected local Kubernetes cluster. These are separate concerns and remain separate stages.
 
-```powershell
-.\scripts\release-workflow.ps1 -Stage All
-```
+Release `v0.1.0` already exists. Do not rerun its `Release` stage or move its tag. This document describes the implemented, release-specific workflow for auditability. Review its defaults, Pull Request text, version, and image references before adapting it to a later release.
 
-The command is interactive. It performs safe validation automatically and stops
-for a `(y/n)` confirmation before every operation that changes Git, GitHub, GHCR
-or the Kubernetes cluster. Only `y` or `Y` approves an operation; Enter, `n`,
-`N` and every other response cancel it. A cancelled or interrupted run can be
-resumed with a specific stage:
+## Concepts
 
-```powershell
-.\scripts\release-workflow.ps1 -Stage Validate
-.\scripts\release-workflow.ps1 -Stage Submit
-.\scripts\release-workflow.ps1 -Stage Release
-.\scripts\release-workflow.ps1 -Stage Deploy -KubeContext docker-desktop
-.\scripts\release-workflow.ps1 -Stage Verify -KubeContext docker-desktop
-```
+| Concept | Role |
+| --- | --- |
+| GitHub Actions | Hosted service that executes repository automation |
+| Workflow | One YAML definition, such as backend tests or container-image build/publish |
+| GHCR | Registry that stores the backend and frontend OCI images |
+| GitHub Release | Versioned repository record associated with a Git tag |
+| Kubernetes Deploy | Applies configuration and a chosen image version to a selected cluster and namespace |
 
-## Responsibilities
+A successful Actions run does not create a deployment. A GHCR image is not a GitHub Release. The release tag can trigger image publication, while deployment is an explicit local operation after the images exist.
 
-### PowerShell and the local machine
+## Entry point
 
-The script:
-
-- checks prerequisites, the expected branch and Git whitespace;
-- scans source filenames for common secret formats without printing values;
-- runs backend tests, frontend lint/typecheck/build, Compose validation,
-  `kubectl kustomize` and `actionlint`;
-- creates the commit, pushes the feature branch and creates the Pull Request only
-  after separate confirmations;
-- waits for PR checks and asks again before squash merge;
-- asks before creating release `v0.1.0` (the tag triggers image publication);
-- checks that both GHCR images are anonymously downloadable and verifies their
-  provenance attestations;
-- asks before changing the selected Kubernetes cluster, synchronizes secrets via
-  dedicated scripts, applies the manifests and verifies the rollout and health
-  endpoints.
-
-PowerShell never prints secret values. The secret synchronization scripts build
-Secret manifests in memory and send them directly to `kubectl`.
-
-### GitHub Actions
-
-- `backend-ci.yml` runs backend unit tests for the Pull Request and `main`.
-- `container-images.yml` builds both Dockerfiles for a Pull Request without
-  publishing anything.
-- A push to `main` publishes `main` and immutable SHA tags.
-- Tag `v0.1.0`, created together with the GitHub Release, publishes `0.1.0`,
-  `0.1`, `latest` and SHA tags for `linux/amd64` and `linux/arm64`.
-- A public repository receives OCI provenance attestations.
-
-### Codex CLI
-
-Codex reviews the proposed local changes and test results, invokes individual
-stages when requested, and stops for the owner's approval before commit, push,
-PR, merge, release/publication and deployment. The deterministic work remains in
-the scripts and GitHub Actions, so another person does not need a Codex session
-to reproduce the release.
-
-## One-time preparation
-
-For the initial `v0.1.0` release in a newly created public repository, push the
-single clean `main` commit, wait for both workflows on that exact commit, and run
-`release-workflow.ps1 -Stage Release`. The Release stage resolves its target only
-from the matching local `main`, `origin/main` and actual remote `main`; it does not
-depend on historical Pull Request metadata.
-
-Required tools:
-
-- Git, Docker with a running engine, Node.js/npm and `kubectl`;
-- GitHub CLI (`gh`) authenticated with access to the repository;
-- a local Kubernetes cluster;
-- Windows PowerShell 5.1 or newer.
-
-Prepare ignored local files (never commit them):
+From the repository root:
 
 ```powershell
-Copy-Item .\infra\k8s\backend-secret.env.example .\infra\k8s\backend-secret.env
+.\scripts\release-workflow.ps1 -Stage <All|Validate|Submit|Release|Deploy|Verify> -Branch <working-branch> -Version <semantic-version> -Namespace rag-document-assistant -KubeContext <context-name> -CommitMessage "<message>"
 ```
 
-The two synchronization scripts use this single source to create separate backend
-and PostgreSQL Secrets with the same database password. See
-[Kubernetes secret documentation](../infra/k8s/SECRETS.md).
+Pass the actual working branch and intended version rather than relying on the release-specific defaults in the script. Parameters do not update Kubernetes image references; those remain version-pinned in the manifests.
 
-Before creating `v0.1.0`, the repository must be public so the release workflow
-can create attestations. GitHub creates newly published container packages as
-private. After the first successful publication, open both package settings and
-change their visibility to **Public**. The script deliberately stops until an
-anonymous manifest check succeeds. This is the only one-time GitHub UI step and
-is necessary for deployment on a new computer without a registry token.
+## Stages
 
-## Approval gates
+| Stage | What it does | External changes |
+| --- | --- | --- |
+| `Validate` | Checks prerequisites and expected branch; checks whitespace and common secret patterns; runs backend tests, frontend lint/type/build, Compose validation, Kustomize rendering, and Actionlint | None |
+| `Submit` | Creates a local commit when needed, pushes the branch, opens or resumes a Pull Request to `main`, waits for required PR workflow runs on the exact head commit, and offers squash merge | Git and GitHub, each behind a confirmation |
+| `Release` | Resolves identical local/remote `main`, waits for required main checks, creates a GitHub Release and tag if absent, waits for image publication, verifies anonymous image access and provenance | GitHub release/tag; no Kubernetes change |
+| `Deploy` | Verifies public release images, resolves the selected context, creates/updates the namespace and both Secrets, applies Kustomize resources, then invokes verification | Selected Kubernetes context and namespace, behind confirmations |
+| `Verify` | Waits for all three rollouts, checks PostgreSQL readiness and frontend/backend health, and prints the port-forward command | Read-only checks against the cluster |
+| `All` | Runs `Validate`, `Submit`, `Release`, and `Deploy`; `Deploy` calls `Verify` | Union of the explicitly approved stage effects |
 
-Every gate uses the same `Continue? (y/n)` question. Before asking, the script
-shows the exact operation and its relevant target: repository and branch for Git
-and GitHub changes, or Kubernetes context, namespace and Secret name for cluster
-changes. Secret values are never displayed.
+Stages can be resumed individually. State-aware checks reuse an existing Pull Request or release and avoid repeating work that is already complete.
 
-Separate gates protect staging and committing, pushing, Pull Request creation,
-squash merge, release/tag creation, deployment, and both Secret synchronization
-operations.
+## Confirmation contract
 
-The script is state-aware for normal retries: it skips an already-created commit,
-an up-to-date push, an existing PR and an existing release. If package visibility
-blocks the first run, set both packages to Public and approve the next `(y/n)`
-gate; the script repeats an anonymous read check without changing package
-settings itself.
+All mutating operations use `scripts/common/confirmation.ps1`.
 
-## After deployment
+Before `Continue? (y/n)`, the script displays:
 
-The script waits for PostgreSQL, backend and frontend rollouts. It then checks
-PostgreSQL readiness, the frontend liveness endpoint, frontend readiness through
-the backend, and the backend health endpoint. To open the application:
+- the exact operation;
+- the repository, branch, remote, Pull Request, commit, or tag when relevant;
+- the Kubernetes context and namespace for cluster operations;
+- the Secret object name for Secret synchronization.
+
+Input handling is deliberately strict:
+
+- `y` or `Y`: approve;
+- `n` or `N`: decline;
+- Enter without text: decline;
+- every other value: decline.
+
+A declined answer throws an operation-cancelled error before the guarded command runs. Long phrases such as `COMMIT`, `PUSH`, `PR`, `MERGE`, `RELEASE v...`, or `DEPLOY ...` are not accepted or required.
+
+The guarded operations include:
+
+- staging and committing the displayed working-tree files;
+- pushing the selected branch;
+- creating a Pull Request;
+- squash merging after required checks pass;
+- creating a GitHub Release and tag;
+- repeating an anonymous GHCR availability check;
+- applying the Kubernetes deployment;
+- synchronizing `backend-secret` and `postgres-secret`.
+
+The regression coverage for approval and denial is in `scripts/tests/confirmation-regression.ps1`. Additional workflow regression scripts protect exact PR-head and `main`-history checks.
+
+## Validate
+
+`Validate` requires Git, Docker with a running engine, `kubectl`, Node.js/npm, `robocopy`, and a compatible PowerShell. Frontend dependencies and build output are isolated in a temporary copy. The stage:
+
+1. verifies the current branch;
+2. confirms local Secret files are not tracked;
+3. runs `git diff --check` for unstaged and staged changes;
+4. scans tracked and untracked source filenames for common credential formats without printing matches;
+5. runs `backend/mvnw.cmd -B test`;
+6. installs frontend dependencies in a temporary copy, then runs lint, typecheck, and build;
+7. validates Compose with non-secret placeholder values;
+8. renders `infra/k8s` with `kubectl kustomize`;
+9. runs Actionlint against GitHub workflow YAML.
+
+Validation does not release or deploy.
+
+## Submit
+
+`Submit` uses authenticated GitHub CLI access. It displays the candidate files before asking to stage and commit. Push, PR creation, and squash merge each have a separate confirmation. The stage waits for these workflow files on the exact Pull Request head SHA:
+
+- `.github/workflows/backend-ci.yml`;
+- `.github/workflows/container-images.yml`.
+
+It refuses to merge when a required run is missing, pending beyond the timeout, failed, or associated with a different head commit. The merge strategy is squash.
+
+## Release and container publication
+
+`Release` requires local `main`, `origin/main`, and the actual remote `main` to identify the same commit and requires a clean working tree. It waits for the backend and container workflows on that commit before offering release creation.
+
+Creating a version tag such as `v0.1.0` triggers `.github/workflows/container-images.yml`. For a version tag, the workflow publishes:
+
+- backend and frontend images;
+- semantic-version tags such as `0.1.0` and `0.1`;
+- `latest`;
+- a full commit-SHA tag;
+- `linux/amd64` and `linux/arm64` manifests.
+
+Relevant pushes to `main` publish `main` and SHA tags. Pull Requests and manual dispatch validate image builds without publishing them. The workflow uses the short-lived `GITHUB_TOKEN`; public repositories can receive OCI provenance attestations.
+
+The Release stage never changes package visibility. If a newly published GHCR package is private, an owner must intentionally change its settings before anonymous deployment can continue.
+
+## Deploy and Verify
+
+`Deploy` targets the explicitly supplied `KubeContext` or the current context and the supplied namespace. Before mutation it prints both values and the affected resource categories. It then invokes the two Secret synchronization scripts, which add their own confirmations.
+
+Secret values:
+
+- come from ignored `infra/k8s/backend-secret.env`;
+- are validated without being printed;
+- are converted to Secret manifests in memory;
+- are piped directly to `kubectl`;
+- are cleared from script variables in cleanup paths.
+
+After applying `infra/k8s`, `Verify` waits for PostgreSQL, backend, and frontend Deployments; checks `pg_isready`; and checks frontend liveness, frontend-to-backend readiness, and backend health.
+
+The manifests use ClusterIP services and no Ingress. Access is local:
 
 ```powershell
-kubectl --namespace=rag-document-assistant port-forward service/frontend 13000:3000
+kubectl --context=<context-name> --namespace=rag-document-assistant port-forward service/frontend 13000:3000
 ```
 
-Visit `http://localhost:13000`.
+Then open `http://localhost:13000`.
+
+## Supporting documentation
+
+- [Kubernetes deployment](../infra/k8s/README.md)
+- [Kubernetes Secret management](../infra/k8s/SECRETS.md)
+- [Local development](local-development.md)
