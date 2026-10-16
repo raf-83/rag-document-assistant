@@ -79,7 +79,9 @@ function Reset-TestState {
     $script:WorkflowCommits = @()
     $script:ReleaseCreateArguments = @()
     $script:ReleaseCreateCount = 0
-    $script:ConfirmationPrompts = @()
+    $script:ConfirmationOperations = @()
+    $script:ConfirmationDetails = @()
+    $script:RejectConfirmation = $false
     $script:RemoteMainAfterConfirmation = ""
 }
 
@@ -147,14 +149,18 @@ function Wait-GitHubWorkflow {
     $script:WorkflowCommits += $Commit
 }
 
-function Confirm-Exact {
+function Confirm-Action {
     param(
-        [string]$Prompt,
-        [string]$Expected
+        [string]$Operation,
+        [string[]]$Details
     )
 
-    $script:ConfirmationPrompts += $Prompt
-    Assert-Equal "RELEASE v$Version" $Expected "The release confirmation gate changed."
+    $script:ConfirmationOperations += $Operation
+    $script:ConfirmationDetails += , @($Details)
+
+    if ($script:RejectConfirmation) {
+        throw "Operation cancelled. Enter y or Y to continue."
+    }
 
     if (-not [string]::IsNullOrWhiteSpace($script:RemoteMainAfterConfirmation)) {
         $script:TestRemoteMain = $script:RemoteMainAfterConfirmation
@@ -192,7 +198,10 @@ Assert-True ($historicalMergeSha -notin $script:ReleaseCreateArguments) "Histori
 Assert-True (@($script:WorkflowCommits | Where-Object { $_ -ne $rewrittenMainSha }).Count -eq 0) "A workflow lookup used a commit outside rewritten main."
 Assert-True (@($script:GitCommands | Where-Object { $_ -like "*$historicalMergeSha*" }).Count -eq 0) "The historical Pull Request commit was consulted during main verification."
 Assert-Equal 1 $script:ReleaseCreateCount "A verified rewritten main should create exactly one release."
-Assert-True ($script:ConfirmationPrompts[0] -like "*$rewrittenMainSha*") "The release confirmation did not show the verified main commit."
+Assert-True ($script:ConfirmationOperations[0] -like "Create GitHub release v$Version*") "The release confirmation did not describe the release operation."
+Assert-True ($script:ConfirmationDetails[0] -contains "Repository: raf-83/rag-document-assistant") "The release confirmation did not show the repository."
+Assert-True ($script:ConfirmationDetails[0] -contains "Branch: main") "The release confirmation did not show the branch."
+Assert-True ($script:ConfirmationDetails[0] -contains "Commit: $rewrittenMainSha") "The release confirmation did not show the verified main commit."
 
 # A stale local main must stop before release creation.
 Reset-TestState
@@ -232,6 +241,19 @@ catch {
 }
 Assert-True $unreachableCommitRejected "An unreachable release commit was not rejected."
 Assert-Equal 0 $script:ReleaseCreateCount "Release creation was attempted for an unreachable commit."
+
+# A rejected confirmation must stop before creating the release or its tag.
+Reset-TestState
+$script:RejectConfirmation = $true
+$confirmationRejected = $false
+try {
+    Invoke-Release
+}
+catch {
+    $confirmationRejected = $_.Exception.Message -like "Operation cancelled.*"
+}
+Assert-True $confirmationRejected "A rejected release confirmation did not cancel the operation."
+Assert-Equal 0 $script:ReleaseCreateCount "Release creation was attempted after confirmation was rejected."
 
 # A force push after the confirmation gate must be detected by the final verification.
 Reset-TestState

@@ -7,6 +7,8 @@ $ErrorActionPreference = "Stop"
 
 $secretName = "postgres-secret"
 $k8sDirectory = Split-Path -Parent $PSScriptRoot
+$repositoryRoot = Split-Path -Parent (Split-Path -Parent $k8sDirectory)
+. (Join-Path $repositoryRoot "scripts/common/confirmation.ps1")
 $envFile = Join-Path $k8sDirectory "backend-secret.env"
 $passwordSourceName = "SPRING_DATASOURCE_PASSWORD"
 $allowedVariables = @(
@@ -91,10 +93,14 @@ try {
     Write-Host "Namespace: $Namespace"
     Write-Host "Secret: $secretName"
 
-    $confirmation = Read-Host "Type YES to synchronize the PostgreSQL secret"
-    if ($confirmation -cne "YES") {
-        throw "Operation cancelled."
-    }
+    Confirm-Action `
+        -Operation "Create or update the PostgreSQL Kubernetes Secret." `
+        -Details @(
+            "Kubernetes context: $context",
+            "Namespace: $Namespace",
+            "Secret: $secretName",
+            "Secret values: not displayed"
+        )
 
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($values[$passwordSourceName])
     $secretData["POSTGRES_PASSWORD"] = [Convert]::ToBase64String($bytes)

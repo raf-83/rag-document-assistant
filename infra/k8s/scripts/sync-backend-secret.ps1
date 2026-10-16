@@ -8,6 +8,8 @@ $ErrorActionPreference = "Stop"
 
 $secretName = "backend-secret"
 $k8sDirectory = Split-Path -Parent $PSScriptRoot
+$repositoryRoot = Split-Path -Parent (Split-Path -Parent $k8sDirectory)
+. (Join-Path $repositoryRoot "scripts/common/confirmation.ps1")
 $envFile = Join-Path $k8sDirectory "backend-secret.env"
 
 $requiredSecrets = @(
@@ -108,12 +110,15 @@ try {
     Write-Host "Namespace: $Namespace"
     Write-Host "Secret: $secretName"
 
-    # 4. Require explicit confirmation.
-    $confirmation = Read-Host "Type YES to synchronize secrets"
-
-    if ($confirmation -cne "YES") {
-        throw "Operation cancelled."
-    }
+    # 4. Require explicit confirmation without displaying secret values.
+    Confirm-Action `
+        -Operation "Create or update the Kubernetes Secret." `
+        -Details @(
+            "Kubernetes context: $context",
+            "Namespace: $Namespace",
+            "Secret: $secretName",
+            "Secret values: not displayed"
+        )
 
     # 5. Create Secret manifest in memory.
     foreach ($name in $requiredSecrets) {

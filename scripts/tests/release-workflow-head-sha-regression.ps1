@@ -85,7 +85,8 @@ function Assert-GitHubCliReady {}
 function Assert-LocalSecretFilesAreUntracked {}
 function Invoke-SecretPatternCheck {}
 function Write-Step { param([string]$Message) }
-function Confirm-Exact { param([string]$Prompt, [string]$Expected) }
+function Get-OriginRepository { return "https://github.example/rag-document-assistant.git" }
+function Confirm-Action { param([string]$Operation, [string[]]$Details) }
 
 function git {
     $command = $args -join " "
