@@ -1,50 +1,43 @@
-# RAG Document Assistant Frontend
+# RAG Document Assistant frontend
 
-Frontend aplikacji RAG Document Assistant zbudowany w Next.js, React i TypeScript. Aplikacja korzysta z Route Handlers jako warstwy BFF między przeglądarką a backendem Spring Boot.
+Next.js 16, React 19, and TypeScript frontend for RAG Document Assistant. Route Handlers form a backend-for-frontend (BFF) between the browser and Spring Boot API.
 
-## Wymagania
+## Requirements
 
-- Node.js zgodny z Next.js 16,
-- działający backend RAG Document Assistant,
-- skonfigurowane środowisko backendu i baza PostgreSQL.
+- Node.js 24 and npm;
+- a running RAG Document Assistant backend;
+- backend database and runtime configuration.
 
-## Konfiguracja
-
-Skopiuj przykładowy plik środowiskowy:
+## Configuration
 
 ```powershell
 Copy-Item .env.example .env.local
 ```
 
-Domyślna konfiguracja developerska:
+`.env.local`:
 
-```text
+```dotenv
 BACKEND_API_URL=http://localhost:8080
 ```
 
-`BACKEND_API_URL` jest używany wyłącznie po stronie serwera Next.js. Nie umieszczaj w plikach środowiskowych tokenów użytkowników ani kluczy API backendu.
+`BACKEND_API_URL` is server-only. Do not put user tokens or backend API keys in frontend environment files.
 
-### Walidacja Origin
+## Security boundary
 
-Operacje zmieniające stan porównują nagłówek `Origin` z publicznym hostem i protokołem bieżącego żądania. Brakujący, niepoprawny lub niedopasowany nagłówek jest odrzucany kodem 403.
+Session route handlers keep access and refresh tokens in `HttpOnly`, `SameSite=Lax` cookies. The backend proxy uses an explicit path allowlist, attaches the access token server-side, and coordinates one refresh attempt after a 401. Protected pages are redirected by `proxy.ts` when no access cookie is present.
 
-Nie trzeba konfigurować stałego publicznego adresu frontendu:
+State-changing BFF requests compare `Origin` with the effective request host and protocol. Missing, malformed, or mismatched origins return 403. Local development and `kubectl port-forward` use `Host`; a trusted reverse proxy can supply `X-Forwarded-Host` and `X-Forwarded-Proto`. Such a proxy must overwrite client-supplied forwarding headers. An HTTPS environment must also set `SESSION_COOKIE_SECURE=true`.
 
-- lokalne uruchomienie i `kubectl port-forward service/frontend 13000:3000` korzystają z nagłówka `Host`,
-- za Ingressem HTTPS aplikacja korzysta z `X-Forwarded-Host` i `X-Forwarded-Proto`.
-
-Ingress lub reverse proxy musi nadpisywać te nagłówki publicznym hostem i protokołem oraz usuwać wartości dostarczone przez klienta. Dla HTTPS ustaw również `SESSION_COOKIE_SECURE=true` w konfiguracji danego środowiska.
-
-## Uruchomienie
+## Run
 
 ```powershell
 npm ci
 npm run dev
 ```
 
-Aplikacja będzie dostępna pod adresem `http://localhost:3000`.
+Open `http://localhost:3000`.
 
-## Kontrole jakości
+## Quality gates
 
 ```powershell
 npm run lint
@@ -52,11 +45,15 @@ npm run typecheck
 npm run build
 ```
 
-## Dostępne obszary
+The repository does not currently contain a separate frontend unit-test suite.
 
-- rejestracja, logowanie i odzyskiwanie konta,
-- bezpieczna sesja oparta o HttpOnly cookies,
-- lista, upload, szczegóły, treść i pobieranie dokumentów,
-- monitoring przetwarzania dokumentów,
-- wyszukiwanie pełnotekstowe, semantyczne i hybrydowe,
-- chat RAG dla gotowych dokumentów.
+## Implemented areas
+
+- registration, login, verification, and password-reset screens;
+- server-managed cookie sessions;
+- document list, upload, details, content, and download;
+- processing-status polling;
+- full-text, semantic, and hybrid search;
+- RAG chat for a selected ready document.
+
+See [Local development](../docs/local-development.md), [Architecture](../docs/architecture.md), and [Implemented API](../docs/api-contract.md).

@@ -1,42 +1,49 @@
-# Git Workflow
+# Git workflow
 
-## Main branch
+`main` is the stable integration branch. Each logical change is prepared on a short-lived branch and submitted through a Pull Request.
 
-- main
+## Branches
 
-## Branch strategy
+Use a descriptive prefix and topic:
 
-Each bigger task is developed on a separate feature branch.
+- `feature/<topic>` for product behavior;
+- `fix/<topic>` for corrections;
+- `docs/<topic>` for documentation;
+- `chore/<topic>` for maintenance.
 
-Examples:
-- feature/init-repo-structure
-- feature/backend-bootstrap
-- feature/frontend-bootstrap
-- feature/auth-module
+Create a branch from an up-to-date `main`:
 
-## Commit style
+```bash
+git switch main
+git pull --ff-only origin main
+git switch -c docs/example-topic
+```
 
-Use simple conventional commit style.
+## Commits
 
-Examples:
-- feat: initialize backend project
-- feat: initialize frontend project
-- docs: add mvp definition
-- chore: add gitignore
-- fix: validate file upload type
+Use an English conventional-style subject, for example:
 
-## Rules
+- `feat: add document chat`;
+- `fix: preserve owner filter in search`;
+- `docs: describe local deployment`;
+- `chore: update build tooling`.
 
-- one logical change per commit
-- do not commit secrets
-- do not commit build artifacts
-- keep main branch stable
-- use English commit messages
+Keep each commit coherent. Do not commit credentials, local environment files, generated Secret manifests, document uploads, dependency directories, or build output.
 
-## Early-stage workflow
+## Validation and review
 
-For early project stages:
-- implement one closed technical step at a time
-- verify the application works locally before committing
-- prefer small and logical commits
-- keep the `main` branch stable and runnable
+Before opening a Pull Request:
+
+1. inspect `git status` and the complete diff;
+2. run tests and quality gates appropriate to the changed area;
+3. run `git diff --check`;
+4. confirm the diff contains only intended files;
+5. scan for credentials and sensitive local data.
+
+Pull Requests target `main`. Required GitHub workflows must pass for the exact current head commit. The automated submission workflow uses squash merge so `main` receives one reviewed commit for the change.
+
+## Releases
+
+Version tags use `vMAJOR.MINOR.PATCH` and are created only from a verified `main` commit. A release tag can trigger GHCR image publication, but publishing, GitHub Release creation, and Kubernetes deployment remain separate operations.
+
+Do not move or overwrite an existing release tag. See [Release workflow](release-workflow.md).
