@@ -7,9 +7,10 @@ The repository uses one PowerShell entry point for the release process:
 ```
 
 The command is interactive. It performs safe validation automatically and stops
-for an exact confirmation before every operation that changes Git, GitHub, GHCR
-or the Kubernetes cluster. A cancelled or interrupted run can be resumed with a
-specific stage:
+for a `(y/n)` confirmation before every operation that changes Git, GitHub, GHCR
+or the Kubernetes cluster. Only `y` or `Y` approves an operation; Enter, `n`,
+`N` and every other response cancel it. A cancelled or interrupted run can be
+resumed with a specific stage:
 
 ```powershell
 .\scripts\release-workflow.ps1 -Stage Validate
@@ -94,22 +95,20 @@ is necessary for deployment on a new computer without a registry token.
 
 ## Approval gates
 
-The script requires these exact confirmations:
+Every gate uses the same `Continue? (y/n)` question. Before asking, the script
+shows the exact operation and its relevant target: repository and branch for Git
+and GitHub changes, or Kubernetes context, namespace and Secret name for cluster
+changes. Secret values are never displayed.
 
-| Confirmation | Effect |
-| --- | --- |
-| `COMMIT` | stage the displayed working tree and create a local commit |
-| `PUSH` | push the feature branch to `origin` |
-| `PR` | create a Pull Request to `main` |
-| `MERGE` | squash-merge the PR after reported checks pass |
-| `RELEASE v0.1.0` | create the release/tag, which triggers GHCR publication |
-| `DEPLOY <context>` | modify the named Kubernetes cluster |
-| `YES` twice | synchronize backend and PostgreSQL Secrets |
+Separate gates protect staging and committing, pushing, Pull Request creation,
+squash merge, release/tag creation, deployment, and both Secret synchronization
+operations.
 
 The script is state-aware for normal retries: it skips an already-created commit,
 an up-to-date push, an existing PR and an existing release. If package visibility
-blocks the first run, set both packages to Public and type `PUBLIC`; the script
-repeats an anonymous read check without changing package settings itself.
+blocks the first run, set both packages to Public and approve the next `(y/n)`
+gate; the script repeats an anonymous read check without changing package
+settings itself.
 
 ## After deployment
 

@@ -12,6 +12,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $script:RepositoryRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot "common/confirmation.ps1")
 $script:ContainerWorkflow = "container-images.yml"
 $script:BackendWorkflow = "backend-ci.yml"
 $script:GitHubCli = $null
@@ -67,21 +68,6 @@ function Invoke-Checked {
     }
 }
 
-function Confirm-Exact {
-    param(
-        [string]$Prompt,
-        [string]$Expected
-    )
-
-    Write-Host ""
-    Write-Host $Prompt -ForegroundColor Yellow
-    $answer = Read-Host "Type exactly '$Expected' to continue"
-
-    if ($answer -cne $Expected) {
-        throw "Operation cancelled. Expected confirmation was not provided."
-    }
-}
-
 function Get-GhJson {
     param(
         [string[]]$Arguments,
@@ -121,6 +107,16 @@ function Assert-ExpectedBranch {
     if ($LASTEXITCODE -ne 0 -or $currentBranch -ne $Branch) {
         throw "Run this workflow from branch '$Branch'. Current branch: '$currentBranch'."
     }
+}
+
+function Get-OriginRepository {
+    $originRepository = (& git --no-pager remote get-url origin | Out-String).Trim()
+
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($originRepository)) {
+        throw "Could not resolve the origin repository."
+    }
+
+    return $originRepository
 }
 
 function Assert-LocalSecretFilesAreUntracked {
@@ -515,12 +511,19 @@ function Invoke-Submit {
         Write-Step "Changes proposed for the commit"
         & git --no-pager status --short
 
-        $commitPrompt = "This will stage every file listed above and create one local commit."
+        $commitDetails = @(
+            "Repository: $(Get-OriginRepository)",
+            "Working tree: $script:RepositoryRoot",
+            "Branch: $Branch",
+            "Commit message: $CommitMessage"
+        )
         if ($continuingExistingPullRequest) {
-            $commitPrompt += " The commit will update Pull Request #$($pullRequest.number) after the separately confirmed push."
+            $commitDetails += "Pull Request: #$($pullRequest.number) will be updated only after the separately confirmed push."
         }
 
-        Confirm-Exact -Prompt $commitPrompt -Expected "COMMIT"
+        Confirm-Action `
+            -Operation "Stage every file listed above and create one local commit." `
+            -Details $commitDetails
 
         Invoke-Checked -FilePath "git" -Arguments @("--no-pager", "add", "--all") -FailureMessage "git add failed"
         Assert-LocalSecretFilesAreUntracked
@@ -554,12 +557,18 @@ function Invoke-Submit {
 
     $pushed = $false
     if ($needsPush) {
-        $pushPrompt = "This will push branch '$Branch' to origin."
+        $pushDetails = @(
+            "Repository: $(Get-OriginRepository)",
+            "Remote: origin",
+            "Branch: $Branch"
+        )
         if ($continuingExistingPullRequest) {
-            $pushPrompt += " The push will update existing Pull Request #$($pullRequest.number)."
+            $pushDetails += "Pull Request: #$($pullRequest.number) will be updated by this push."
         }
 
-        Confirm-Exact -Prompt $pushPrompt -Expected "PUSH"
+        Confirm-Action `
+            -Operation "Push the local branch to the remote repository." `
+            -Details $pushDetails
         Invoke-Checked -FilePath "git" -Arguments @("--no-pager", "push", "--set-upstream", "origin", $Branch) -FailureMessage "git push failed"
         $pushed = $true
     }
@@ -575,7 +584,13 @@ function Invoke-Submit {
     }
 
     if ($null -eq $pullRequest) {
-        Confirm-Exact -Prompt "This will create a Pull Request from '$Branch' to 'main'." -Expected "PR"
+        Confirm-Action `
+            -Operation "Create a Pull Request." `
+            -Details @(
+                "Repository: $(Get-OriginRepository)",
+                "Source branch: $Branch",
+                "Target branch: main"
+            )
 
         $prBody = @"
 ## Summary
@@ -635,7 +650,14 @@ function Invoke-Submit {
         throw "Pull Request head changed from $validatedHeadSha to $($pullRequestBeforeMergePrompt.headRefOid) while waiting for CI. Restart the Submit stage to validate the new commit."
     }
 
-    Confirm-Exact -Prompt "All required checks passed. This will squash-merge Pull Request #$($pullRequest.number) into main." -Expected "MERGE"
+    Confirm-Action `
+        -Operation "Squash-merge Pull Request #$($pullRequest.number)." `
+        -Details @(
+            "Repository: $(Get-OriginRepository)",
+            "Source branch: $($pullRequestBeforeMergePrompt.headRefName)",
+            "Target branch: $($pullRequestBeforeMergePrompt.baseRefName)",
+            "Validated commit: $validatedHeadSha"
+        )
 
     $pullRequestBeforeMerge = Get-PullRequestByNumber -PullRequestNumber $pullRequest.number
     if ($pullRequestBeforeMerge.state -ne "OPEN") {
@@ -802,7 +824,13 @@ function Assert-ReleaseImagesArePublic {
             throw "Set both GHCR packages to Public in GitHub package settings, then retry."
         }
 
-        Confirm-Exact -Prompt "Set both newly published GHCR packages to Public in GitHub package settings. The script will only perform another anonymous read check." -Expected "PUBLIC"
+        Confirm-Action `
+            -Operation "Repeat the anonymous availability check for both release images. This does not change package settings." `
+            -Details @(
+                "Registry repository: ghcr.io/raf-83/rag-document-assistant",
+                "Version: $Version",
+                "Images: backend and frontend"
+            )
     } while ($true)
 }
 
@@ -822,7 +850,14 @@ function Invoke-Release {
     $existingRelease = Get-GhJson -Arguments @("release", "view", "v$Version", "--json", "tagName,url") -AllowFailure
 
     if ($null -eq $existingRelease) {
-        Confirm-Exact -Prompt "This will create GitHub release v$Version at $releaseCommit. Pushing its tag automatically publishes both multi-platform images to GHCR." -Expected "RELEASE v$Version"
+        Confirm-Action `
+            -Operation "Create GitHub release v$Version and its tag. The tag triggers publication of both multi-platform images to GHCR." `
+            -Details @(
+                "Repository: $($repository.nameWithOwner)",
+                "Branch: main",
+                "Commit: $releaseCommit",
+                "Tag: v$Version"
+            )
 
         $releaseCommitBeforeCreation = Resolve-VerifiedReleaseCommit
         if ($releaseCommitBeforeCreation -ne $releaseCommit) {
@@ -884,7 +919,13 @@ function Invoke-Deploy {
 
     Write-Host "Kubernetes context: $context"
     Write-Host "Namespace: $Namespace"
-    Confirm-Exact -Prompt "This will create or update the application, PostgreSQL, persistent volumes and Kubernetes Secrets in the selected cluster." -Expected "DEPLOY $context"
+    Confirm-Action `
+        -Operation "Create or update the application, PostgreSQL, persistent volumes and Kubernetes Secrets." `
+        -Details @(
+            "Kubernetes context: $context",
+            "Namespace: $Namespace",
+            "Kubernetes Secrets: backend-secret and postgres-secret (values are not displayed)"
+        )
 
     $namespaceManifest = & kubectl --context=$context create namespace $Namespace --dry-run=client -o yaml
     if ($LASTEXITCODE -ne 0) {

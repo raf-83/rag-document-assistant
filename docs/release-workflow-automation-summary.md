@@ -71,18 +71,10 @@ Actions, więc cały proces może zostać wykonany również bez sesji Codex.
 
 ## Bramki akceptacji
 
-Skrypt wymaga następujących potwierdzeń:
-
-| Potwierdzenie | Operacja |
-| --- | --- |
-| `COMMIT` | dodanie wyświetlonych zmian do indeksu i utworzenie commita |
-| `PUSH` | wypchnięcie brancha do `origin` |
-| `PR` | utworzenie Pull Requesta do `main` |
-| `MERGE` | squash merge po przejściu CI |
-| `RELEASE v0.1.0` | utworzenie wydania i tagu uruchamiającego publikację GHCR |
-| `PUBLIC` | ponowienie anonimowej kontroli po ręcznym upublicznieniu pakietów |
-| `DEPLOY <context>` | zmiana wskazanego klastra Kubernetes |
-| `YES` dwa razy | synchronizacja Secretów backendu i PostgreSQL |
+Każda bramka używa pytania `Continue? (y/n)`. Wyłącznie `y` lub `Y` zatwierdza
+operację; Enter, `n`, `N` i każda inna odpowiedź ją anuluje. Przed pytaniem
+skrypt pokazuje dokładną operację oraz repozytorium i branch albo kontekst
+Kubernetes, namespace i nazwę Secretu. Wartości Secretów nie są wyświetlane.
 
 ## Zmienione lub dodane pliki automatyzacji
 
