@@ -76,7 +76,7 @@ The guarded operations include:
 - applying the Kubernetes deployment;
 - synchronizing `backend-secret` and `postgres-secret`.
 
-The regression coverage for approval and denial is in `scripts/tests/confirmation-regression.ps1`. `scripts/tests/submit-proposal-regression.ps1` covers proposal parsing, manual fallback, editing, regeneration, cancellation, safe path selection, untracked and ignored files, exact staging, and resumable state. Additional workflow regression scripts protect exact PR-head and `main`-history checks.
+The regression coverage for approval and denial is in `scripts/tests/confirmation-regression.ps1`. `scripts/tests/submit-proposal-regression.ps1` covers proposal parsing, manual fallback, editing, regeneration, cancellation, safe path selection, untracked and ignored files, exact staging, and resumable state. `scripts/tests/release-workflow-check-filters-regression.ps1` covers filtered docs/scripts Pull Requests, applicable backend/frontend changes, missing, pending, and failed runs, and API failures. Additional workflow regression scripts protect exact PR-head and `main`-history checks.
 
 ## Validate
 
@@ -118,12 +118,14 @@ The displayed proposal can be accepted (`a`), edited (`e`), regenerated (`r`), o
 
 Pre-staged paths that are not selected are removed from the index without changing their working-tree content. Submit verifies that the final staged set exactly equals the accepted file list; it does not use `git add --all`. After a successful commit, the accepted PR metadata is stored under the repository's private Git metadata directory. A rerun for the same branch and HEAD can resume after an interrupted commit or push without regenerating inconsistent PR text; state for another branch or commit is ignored.
 
-The stage waits for these workflow files on the exact Pull Request head SHA:
+The stage evaluates the `pull_request` path filters in these workflow files at the exact Pull Request head SHA:
 
 - `.github/workflows/backend-ci.yml`;
 - `.github/workflows/container-images.yml`.
 
-It refuses to merge when a required run is missing, pending beyond the timeout, failed, or associated with a different head commit. It rechecks the PR head and CI immediately before calling GitHub CLI with `--match-head-commit`. The merge strategy is squash.
+Changed paths are read from the Pull Request API. A workflow excluded by its configured `paths` or `paths-ignore` filters is not awaited; a workflow whose filters match remains required even before GitHub reports its run. API, workflow-reading, or filter-parsing errors stop Submit instead of being treated as skipped checks.
+
+For every applicable workflow, Submit refuses to merge when a required run is missing, pending beyond the timeout, failed, or associated with a different head commit. It rechecks the PR head and CI immediately before calling GitHub CLI with `--match-head-commit`. The merge strategy is squash.
 
 ## Release and container publication
 

@@ -487,6 +487,310 @@ function Get-PullRequestWorkflowRun {
         Select-Object -First 1
 }
 
+function Get-PullRequestChangedPaths {
+    param([ValidateRange(1, [int]::MaxValue)][int]$PullRequestNumber)
+
+    $paths = @(Get-GhJson -Arguments @(
+        "api",
+        "--paginate",
+        "--slurp",
+        "repos/{owner}/{repo}/pulls/$PullRequestNumber/files?per_page=100",
+        "--jq", "add | map([.filename, .previous_filename] | map(select(. != null))) | add | unique"
+    ))
+
+    if ($paths.Count -eq 0) {
+        throw "GitHub API returned no changed files for Pull Request #$PullRequestNumber. Workflow path filters cannot be evaluated safely."
+    }
+
+    $validatedPaths = foreach ($path in $paths) {
+        $normalizedPath = "$path".Trim().Replace("\", "/")
+        if ([string]::IsNullOrWhiteSpace($normalizedPath) -or $normalizedPath.StartsWith("/") -or $normalizedPath.Contains("../")) {
+            throw "GitHub API returned an invalid changed path for Pull Request #${PullRequestNumber}: '$path'."
+        }
+
+        $normalizedPath
+    }
+
+    return @($validatedPaths | Sort-Object -Unique)
+}
+
+function Get-WorkflowFileContentAtCommit {
+    param(
+        [string]$Workflow,
+        [string]$HeadSha
+    )
+
+    if ($Workflow -notmatch "^[A-Za-z0-9._-]+\.(?:yml|yaml)$") {
+        throw "Invalid GitHub Actions workflow file name: '$Workflow'."
+    }
+    if ($HeadSha -notmatch "^[0-9a-fA-F]{40,64}$") {
+        throw "Cannot inspect workflow '$Workflow' for invalid commit '$HeadSha'."
+    }
+
+    $workflowPath = ".github/workflows/$Workflow"
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $content = @(& git --no-pager show "${HeadSha}:$workflowPath" 2>$null)
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    if ($exitCode -ne 0) {
+        throw "Could not read workflow '$workflowPath' from Pull Request commit $HeadSha."
+    }
+
+    $text = $content -join [Environment]::NewLine
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        throw "Workflow '$workflowPath' is empty at Pull Request commit $HeadSha."
+    }
+
+    return $text
+}
+
+function ConvertFrom-WorkflowYamlListValue {
+    param(
+        [string]$Value,
+        [string]$Workflow,
+        [string]$FilterName
+    )
+
+    $trimmed = $Value.Trim()
+    if ($trimmed -match "^'(?<value>(?:[^']|'')*)'\s*(?:#.*)?$") {
+        return $Matches.value.Replace("''", "'")
+    }
+    if ($trimmed -match '^"(?<value>(?:[^"\\]|\\.)*)"\s*(?:#.*)?$') {
+        return [System.Text.RegularExpressions.Regex]::Unescape($Matches.value)
+    }
+    if ($trimmed -match "^(?<value>.*?)(?:\s+#.*)?$") {
+        return $Matches.value.Trim()
+    }
+
+    throw "Could not parse '$FilterName' in workflow '$Workflow': $Value"
+}
+
+function Get-WorkflowPullRequestPathFilters {
+    param(
+        [string]$Workflow,
+        [string]$Content
+    )
+
+    $lines = @($Content -split "\r?\n")
+    $onLineIndex = -1
+    $onIndent = -1
+
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        $line = $lines[$index]
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith("#")) {
+            continue
+        }
+
+        $indent = $line.Length - $line.TrimStart().Length
+        if ($indent -eq 0 -and $line.Trim() -match '^(?:on|''on''|"on")\s*:\s*$') {
+            $onLineIndex = $index
+            $onIndent = $indent
+            break
+        }
+    }
+
+    if ($onLineIndex -lt 0) {
+        throw "Could not find the GitHub Actions 'on' mapping in workflow '$Workflow'."
+    }
+
+    $pullRequestLineIndex = -1
+    $pullRequestIndent = -1
+    for ($index = $onLineIndex + 1; $index -lt $lines.Count; $index++) {
+        $line = $lines[$index]
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith("#")) {
+            continue
+        }
+
+        $indent = $line.Length - $line.TrimStart().Length
+        if ($indent -le $onIndent) {
+            break
+        }
+        if ($line.Trim() -match '^(?:pull_request|''pull_request''|"pull_request")\s*:\s*(?<value>.*)$') {
+            $inlineValue = $Matches.value.Trim()
+            if (-not [string]::IsNullOrWhiteSpace($inlineValue) -and $inlineValue -ne "{}") {
+                throw "Unsupported inline pull_request configuration in workflow '$Workflow'."
+            }
+            $pullRequestLineIndex = $index
+            $pullRequestIndent = $indent
+            break
+        }
+    }
+
+    if ($pullRequestLineIndex -lt 0) {
+        throw "Workflow '$Workflow' is required by Submit but has no pull_request trigger."
+    }
+
+    $filters = @{
+        Paths = @()
+        PathsIgnore = @()
+    }
+
+    for ($index = $pullRequestLineIndex + 1; $index -lt $lines.Count; $index++) {
+        $line = $lines[$index]
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith("#")) {
+            continue
+        }
+
+        $indent = $line.Length - $line.TrimStart().Length
+        if ($indent -le $pullRequestIndent) {
+            break
+        }
+        if ($line.Trim() -notmatch '^(?<name>paths|paths-ignore)\s*:\s*(?<inline>.*)$') {
+            continue
+        }
+
+        $filterName = $Matches.name
+        if (-not [string]::IsNullOrWhiteSpace($Matches.inline)) {
+            throw "Unsupported inline '$filterName' configuration in workflow '$Workflow'. Use a YAML list so Submit can evaluate it safely."
+        }
+
+        $filterIndent = $indent
+        $values = @()
+        for ($valueIndex = $index + 1; $valueIndex -lt $lines.Count; $valueIndex++) {
+            $valueLine = $lines[$valueIndex]
+            if ([string]::IsNullOrWhiteSpace($valueLine) -or $valueLine.TrimStart().StartsWith("#")) {
+                continue
+            }
+
+            $valueIndent = $valueLine.Length - $valueLine.TrimStart().Length
+            if ($valueIndent -le $filterIndent) {
+                break
+            }
+            if ($valueLine.Trim() -notmatch '^\-\s+(?<value>.+)$') {
+                throw "Could not parse '$filterName' in workflow '$Workflow': $($valueLine.Trim())"
+            }
+
+            $values += ConvertFrom-WorkflowYamlListValue -Value $Matches.value -Workflow $Workflow -FilterName $filterName
+            $index = $valueIndex
+        }
+
+        if ($values.Count -eq 0) {
+            throw "Workflow '$Workflow' contains an empty '$filterName' list."
+        }
+
+        if ($filterName -eq "paths") {
+            $filters.Paths = @($values)
+        }
+        else {
+            $filters.PathsIgnore = @($values)
+        }
+    }
+
+    if ($filters.Paths.Count -gt 0 -and $filters.PathsIgnore.Count -gt 0) {
+        throw "Workflow '$Workflow' contains both 'paths' and 'paths-ignore' for pull_request."
+    }
+
+    return [pscustomobject]$filters
+}
+
+function ConvertTo-GitHubPathRegex {
+    param(
+        [string]$Pattern,
+        [string]$Workflow
+    )
+
+    $builder = [System.Text.StringBuilder]::new("^")
+    for ($index = 0; $index -lt $Pattern.Length; $index++) {
+        $character = $Pattern[$index]
+        if ($character -eq "*") {
+            if ($index + 1 -lt $Pattern.Length -and $Pattern[$index + 1] -eq "*") {
+                $index++
+                if ($index + 1 -lt $Pattern.Length -and $Pattern[$index + 1] -eq "/") {
+                    [void]$builder.Append("(?:.*/)?")
+                    $index++
+                }
+                else {
+                    [void]$builder.Append(".*")
+                }
+            }
+            else {
+                [void]$builder.Append("[^/]*")
+            }
+            continue
+        }
+        if ($character -eq "?") {
+            [void]$builder.Append("[^/]")
+            continue
+        }
+        if ($character -in @("[", "]", "+")) {
+            throw "Unsupported advanced pull_request path pattern '$Pattern' in workflow '$Workflow'."
+        }
+
+        [void]$builder.Append([System.Text.RegularExpressions.Regex]::Escape("$character"))
+    }
+
+    [void]$builder.Append("$")
+    return $builder.ToString()
+}
+
+function Test-PathMatchesWorkflowPatterns {
+    param(
+        [string]$Path,
+        [string[]]$Patterns,
+        [string]$Workflow,
+        [switch]$AllowNegation
+    )
+
+    $matches = $false
+    foreach ($configuredPattern in $Patterns) {
+        $pattern = "$configuredPattern"
+        $negative = $pattern.StartsWith("!")
+        if ($negative) {
+            if (-not $AllowNegation) {
+                throw "Negative path pattern '$pattern' is not supported in paths-ignore for workflow '$Workflow'."
+            }
+            $pattern = $pattern.Substring(1)
+        }
+        if ([string]::IsNullOrWhiteSpace($pattern)) {
+            throw "Workflow '$Workflow' contains an empty pull_request path pattern."
+        }
+
+        $regex = ConvertTo-GitHubPathRegex -Pattern $pattern -Workflow $Workflow
+        if ($Path -match $regex) {
+            $matches = -not $negative
+        }
+    }
+
+    return $matches
+}
+
+function Test-WorkflowRunsForPullRequest {
+    param(
+        [string]$Workflow,
+        [string]$HeadSha,
+        [string[]]$ChangedPaths
+    )
+
+    $content = Get-WorkflowFileContentAtCommit -Workflow $Workflow -HeadSha $HeadSha
+    $filters = Get-WorkflowPullRequestPathFilters -Workflow $Workflow -Content $content
+
+    if ($filters.Paths.Count -gt 0) {
+        foreach ($path in $ChangedPaths) {
+            if (Test-PathMatchesWorkflowPatterns -Path $path -Patterns $filters.Paths -Workflow $Workflow -AllowNegation) {
+                return $true
+            }
+        }
+        return $false
+    }
+
+    if ($filters.PathsIgnore.Count -gt 0) {
+        foreach ($path in $ChangedPaths) {
+            if (-not (Test-PathMatchesWorkflowPatterns -Path $path -Patterns $filters.PathsIgnore -Workflow $Workflow)) {
+                return $true
+            }
+        }
+        return $false
+    }
+
+    return $true
+}
+
 function Wait-PullRequestChecks {
     param(
         [int]$PullRequestNumber,
@@ -499,6 +803,17 @@ function Wait-PullRequestChecks {
         throw "Could not resolve the current head commit for Pull Request #$PullRequestNumber."
     }
 
+    $changedPaths = @(Get-PullRequestChangedPaths -PullRequestNumber $PullRequestNumber)
+    $requiredWorkflows = @()
+    foreach ($requiredWorkflow in $script:RequiredPullRequestWorkflows) {
+        if (Test-WorkflowRunsForPullRequest -Workflow $requiredWorkflow.File -HeadSha $HeadSha -ChangedPaths $changedPaths) {
+            $requiredWorkflows += $requiredWorkflow
+        }
+        else {
+            Write-Host "Skipping Pull Request workflow '$($requiredWorkflow.Name)' because its path filters do not match the changed files."
+        }
+    }
+
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $lastStatusMessage = ""
 
@@ -508,7 +823,7 @@ function Wait-PullRequestChecks {
         $failed = @()
         $passed = @()
 
-        foreach ($requiredWorkflow in $script:RequiredPullRequestWorkflows) {
+        foreach ($requiredWorkflow in $requiredWorkflows) {
             $run = Get-PullRequestWorkflowRun -Workflow $requiredWorkflow.File -HeadSha $HeadSha
 
             if ($null -eq $run) {
