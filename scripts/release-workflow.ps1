@@ -7,12 +7,14 @@ param(
     [string]$Version = "0.1.0",
     [string]$Namespace = "rag-document-assistant",
     [string]$KubeContext = "",
-    [string]$CommitMessage = "feat: add portable Kubernetes deployment"
+    [string]$CommitMessage = "chore: submit current changes"
 )
 
 $ErrorActionPreference = "Stop"
 $script:RepositoryRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot "common/confirmation.ps1")
+. (Join-Path $PSScriptRoot "common/submit-proposal.ps1")
+$script:BranchParameterWasProvided = $PSBoundParameters.ContainsKey("Branch")
 $script:ContainerWorkflow = "container-images.yml"
 $script:BackendWorkflow = "backend-ci.yml"
 $script:GitHubCli = $null
@@ -89,16 +91,21 @@ function Get-GhJson {
             return $null
         }
 
-        throw "GitHub CLI command failed: gh $($Arguments -join ' ')"
+        throw "GitHub CLI command failed (exit code: $exitCode): gh $($Arguments -join ' '). Verify GitHub CLI authentication and network access."
     }
 
     $text = ($output | Out-String).Trim()
 
     if ([string]::IsNullOrWhiteSpace($text)) {
-        return $null
+        throw "GitHub CLI returned an empty response: gh $($Arguments -join ' ')"
     }
 
-    return $text | ConvertFrom-Json
+    try {
+        return $text | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "GitHub CLI returned invalid JSON: gh $($Arguments -join ' '). $($_.Exception.Message)"
+    }
 }
 
 function Assert-ExpectedBranch {
@@ -107,6 +114,22 @@ function Assert-ExpectedBranch {
     if ($LASTEXITCODE -ne 0 -or $currentBranch -ne $Branch) {
         throw "Run this workflow from branch '$Branch'. Current branch: '$currentBranch'."
     }
+}
+
+function Resolve-SubmitBranch {
+    $currentBranch = (& git --no-pager branch --show-current | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($currentBranch)) {
+        throw "Could not resolve the current Git branch."
+    }
+    if ($currentBranch -in @("main", "master")) {
+        throw "Submit requires a working branch. Refusing to submit directly from '$currentBranch'."
+    }
+
+    if (-not $script:BranchParameterWasProvided) {
+        $script:Branch = $currentBranch
+    }
+
+    Assert-ExpectedBranch
 }
 
 function Get-OriginRepository {
@@ -324,26 +347,90 @@ function Assert-GitHubCliReady {
     Invoke-Checked -FilePath $script:GitHubCli -Arguments @("auth", "status") -FailureMessage "GitHub CLI is not authenticated"
 }
 
+function ConvertTo-ValidatedPullRequest {
+    param(
+        [AllowNull()][object]$InputObject,
+        [int]$ExpectedNumber = 0
+    )
+
+    if ($null -eq $InputObject) {
+        throw "GitHub CLI returned an empty Pull Request object."
+    }
+
+    $propertyNames = @($InputObject.PSObject.Properties | ForEach-Object { $_.Name })
+    foreach ($propertyName in @("number", "state", "url", "mergeCommit", "headRefName", "headRefOid", "baseRefName")) {
+        if ($propertyNames -notcontains $propertyName) {
+            throw "GitHub CLI returned an incomplete Pull Request object. Missing property: $propertyName."
+        }
+    }
+
+    $number = 0
+    if (-not [int]::TryParse("$($InputObject.number)", [ref]$number) -or $number -le 0) {
+        throw "GitHub CLI returned an invalid Pull Request number."
+    }
+    if ($ExpectedNumber -gt 0 -and $number -ne $ExpectedNumber) {
+        throw "GitHub CLI returned Pull Request #$number while #$ExpectedNumber was requested."
+    }
+
+    $state = "$($InputObject.state)".Trim().ToUpperInvariant()
+    if ($state -notin @("OPEN", "CLOSED", "MERGED")) {
+        throw "GitHub CLI returned an invalid state for Pull Request #${number}: '$($InputObject.state)'."
+    }
+    if ([string]::IsNullOrWhiteSpace("$($InputObject.url)")) {
+        throw "GitHub CLI returned no URL for Pull Request #$number."
+    }
+    if ([string]::IsNullOrWhiteSpace("$($InputObject.headRefName)")) {
+        throw "GitHub CLI returned no source branch for Pull Request #$number."
+    }
+    if ([string]::IsNullOrWhiteSpace("$($InputObject.baseRefName)")) {
+        throw "GitHub CLI returned no target branch for Pull Request #$number."
+    }
+    if ("$($InputObject.headRefOid)" -notmatch "^[0-9a-fA-F]{40,64}$") {
+        throw "GitHub CLI returned an invalid head commit for Pull Request #$number."
+    }
+
+    return $InputObject
+}
+
 function Get-CurrentPullRequest {
-    $pullRequests = @(Get-GhJson -Arguments @(
+    $response = Get-GhJson -Arguments @(
         "pr", "list",
         "--head", $Branch,
         "--base", "main",
         "--state", "all",
         "--limit", "1",
         "--json", "number,state,url,mergeCommit,headRefName,headRefOid,baseRefName"
-    ))
+    )
+    $pullRequests = @($response)
 
-    return $pullRequests | Select-Object -First 1
+    if ($pullRequests.Count -eq 0) {
+        return $null
+    }
+    if ($pullRequests.Count -ne 1) {
+        throw "GitHub CLI returned $($pullRequests.Count) Pull Requests although at most one was requested."
+    }
+
+    $pullRequest = ConvertTo-ValidatedPullRequest -InputObject $pullRequests[0]
+    if ($pullRequest.headRefName -ne $Branch -or $pullRequest.baseRefName -ne "main") {
+        throw "GitHub CLI returned Pull Request #$($pullRequest.number) for '$($pullRequest.headRefName)' -> '$($pullRequest.baseRefName)', expected '$Branch' -> 'main'."
+    }
+
+    return $pullRequest
 }
 
 function Get-PullRequestByNumber {
-    param([int]$PullRequestNumber)
+    param([ValidateRange(1, [int]::MaxValue)][int]$PullRequestNumber)
 
-    return Get-GhJson -Arguments @(
+    $response = Get-GhJson -Arguments @(
         "pr", "view", "$PullRequestNumber",
         "--json", "number,state,url,mergeCommit,headRefName,headRefOid,baseRefName"
     )
+    $pullRequests = @($response)
+    if ($pullRequests.Count -ne 1) {
+        throw "GitHub CLI returned $($pullRequests.Count) Pull Request objects for requested Pull Request #$PullRequestNumber."
+    }
+
+    return ConvertTo-ValidatedPullRequest -InputObject $pullRequests[0] -ExpectedNumber $PullRequestNumber
 }
 
 function Wait-PullRequestHead {
@@ -483,7 +570,7 @@ function Wait-PullRequestChecks {
 }
 
 function Invoke-Submit {
-    Assert-ExpectedBranch
+    Resolve-SubmitBranch
     Assert-GitHubCliReady
 
     $pullRequest = Get-CurrentPullRequest
@@ -494,6 +581,7 @@ function Invoke-Submit {
 
         if ($pullRequest.state -eq "MERGED") {
             Write-Host "Pull Request is already merged."
+            Remove-SubmitProposalState
             return
         }
 
@@ -502,45 +590,56 @@ function Invoke-Submit {
         }
     }
 
-    $changes = @(& git --no-pager status --porcelain)
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not read Git status."
-    }
+    Assert-LocalSecretFilesAreUntracked
+    Invoke-SecretPatternCheck
+    $candidatePaths = @(Get-SubmitCandidatePaths -RepositoryRoot $script:RepositoryRoot)
+    $proposal = $null
 
-    if ($changes.Count -gt 0) {
-        Write-Step "Changes proposed for the commit"
-        & git --no-pager status --short
+    if ($candidatePaths.Count -gt 0) {
+        Write-Step "Preparing a commit and Pull Request proposal"
+        $proposal = Get-ApprovedSubmitProposal `
+            -CandidatePaths $candidatePaths `
+            -RepositoryRoot $script:RepositoryRoot `
+            -DefaultCommitMessage $CommitMessage
 
         $commitDetails = @(
             "Repository: $(Get-OriginRepository)",
             "Working tree: $script:RepositoryRoot",
             "Branch: $Branch",
-            "Commit message: $CommitMessage"
+            "Files: $($proposal.Files -join ', ')",
+            "Commit message: $($proposal.CommitMessage)"
         )
         if ($continuingExistingPullRequest) {
             $commitDetails += "Pull Request: #$($pullRequest.number) will be updated only after the separately confirmed push."
         }
 
         Confirm-Action `
-            -Operation "Stage every file listed above and create one local commit." `
+            -Operation "Stage only the accepted files and create one local commit." `
             -Details $commitDetails
 
-        Invoke-Checked -FilePath "git" -Arguments @("--no-pager", "add", "--all") -FailureMessage "git add failed"
+        Set-SubmitStagingSelection -SelectedPaths $proposal.Files
         Assert-LocalSecretFilesAreUntracked
         Invoke-SecretPatternCheck
         Invoke-Checked -FilePath "git" -Arguments @("--no-pager", "diff", "--cached", "--check") -FailureMessage "Staged whitespace check failed"
 
         Write-Step "Staged files"
         & git --no-pager diff --cached --name-status
-        Invoke-Checked -FilePath "git" -Arguments @("--no-pager", "commit", "-m", $CommitMessage) -FailureMessage "git commit failed"
+        Invoke-Checked -FilePath "git" -Arguments @("--no-pager", "commit", "-m", $proposal.CommitMessage) -FailureMessage "git commit failed"
     }
     else {
-        Write-Host "Working tree is clean; no commit is needed."
+        Write-Host "No eligible working-tree changes require a commit. Ignored, secret, and local-report paths are never submitted."
     }
 
     $localHeadSha = (& git --no-pager rev-parse HEAD | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($localHeadSha)) {
         throw "Could not resolve the local HEAD commit."
+    }
+
+    if ($null -ne $proposal) {
+        Save-SubmitProposalState -Proposal $proposal -Branch $Branch -HeadSha $localHeadSha
+    }
+    else {
+        $proposal = Get-SubmitProposalState -Branch $Branch -HeadSha $localHeadSha
     }
 
     $remoteName = (& git --no-pager config --get "branch.$Branch.remote" | Out-String).Trim()
@@ -584,36 +683,31 @@ function Invoke-Submit {
     }
 
     if ($null -eq $pullRequest) {
+        if ($null -eq $proposal) {
+            $headSubject = (& git --no-pager log -1 --pretty=%s | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($headSubject)) {
+                throw "Could not resolve a default Pull Request title from HEAD."
+            }
+            $proposal = New-ManualSubmitPullRequestMetadata -DefaultTitle $headSubject
+            Show-SubmitProposal -Proposal $proposal
+        }
+
         Confirm-Action `
             -Operation "Create a Pull Request." `
             -Details @(
                 "Repository: $(Get-OriginRepository)",
                 "Source branch: $Branch",
-                "Target branch: main"
+                "Target branch: main",
+                "Pull Request title: $($proposal.PullRequestTitle)",
+                "Pull Request body:`n$($proposal.PullRequestBody)"
             )
-
-        $prBody = @"
-## Summary
-
-- add repeatable Kubernetes deployment for PostgreSQL, backend and frontend
-- publish versioned backend and frontend images to GHCR
-- keep frontend health checks and Origin validation suitable for local port-forward and future HTTPS
-
-## Validation
-
-- backend unit tests
-- frontend lint, typecheck and production build
-- Docker Compose configuration validation
-- Kubernetes manifest rendering
-- GitHub Actions lint
-"@
 
         Invoke-Checked -FilePath $script:GitHubCli -Arguments @(
             "pr", "create",
             "--base", "main",
             "--head", $Branch,
-            "--title", "feat: add portable Kubernetes deployment",
-            "--body", $prBody
+            "--title", $proposal.PullRequestTitle,
+            "--body", $proposal.PullRequestBody
         ) -FailureMessage "Pull Request creation failed"
 
         $pullRequest = Get-CurrentPullRequest
@@ -687,6 +781,7 @@ function Invoke-Submit {
     }
 
     Write-Host "Pull Request merged as $($mergedPullRequest.mergeCommit.oid)."
+    Remove-SubmitProposalState
 }
 
 function Resolve-VerifiedReleaseCommit {

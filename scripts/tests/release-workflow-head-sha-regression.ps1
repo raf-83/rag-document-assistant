@@ -76,14 +76,19 @@ $newHeadSha = "e78bd9600000000000000000000000000000000"
 $changedHeadSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 $Branch = "feature/frontend-kubernetes"
 $CommitMessage = "test commit"
+$script:RepositoryRoot = "C:\test\rag-document-assistant"
 $script:GitHubCli = "gh"
 $script:PullRequestHeadRefreshTimeoutSeconds = 1
 $script:PullRequestHeadRefreshPollIntervalSeconds = 0
 
 function Assert-ExpectedBranch {}
+function Resolve-SubmitBranch {}
 function Assert-GitHubCliReady {}
 function Assert-LocalSecretFilesAreUntracked {}
 function Invoke-SecretPatternCheck {}
+function Get-SubmitCandidatePaths { param([string]$RepositoryRoot) return @() }
+function Get-SubmitProposalState { param([string]$Branch, [string]$HeadSha) return $null }
+function Remove-SubmitProposalState {}
 function Write-Step { param([string]$Message) }
 function Get-OriginRepository { return "https://github.example/rag-document-assistant.git" }
 function Confirm-Action { param([string]$Operation, [string[]]$Details) }
@@ -235,5 +240,29 @@ catch {
 }
 Assert-True $pendingRejected "Pending required workflows were not rejected immediately before merge."
 Assert-Equal 0 $script:MergeInvocationCount "Merge was attempted while required workflows were pending."
+
+# Declining the commit confirmation must stop before staging, commit, push, or merge.
+function Get-SubmitCandidatePaths { param([string]$RepositoryRoot) return @("safe-change.txt") }
+function Get-ApprovedSubmitProposal {
+    param([string[]]$CandidatePaths, [string]$RepositoryRoot, [string]$DefaultCommitMessage)
+    return [pscustomobject]@{
+        Files = @("safe-change.txt")
+        CommitMessage = "test: safe change"
+        PullRequestTitle = "test: safe change"
+        PullRequestBody = "## Summary`n`n- safe change`n`n## Tests`n`n- regression"
+    }
+}
+function Confirm-Action { param([string]$Operation, [string[]]$Details) throw "Operation cancelled. Enter y or Y to continue." }
+function Set-SubmitStagingSelection { param([string[]]$SelectedPaths) $script:StagingInvocationCount++ }
+$script:InitialPullRequestHeadSha = $newHeadSha
+Reset-TestState -AheadCount 1 -PullRequestResponses @()
+$script:StagingInvocationCount = 0
+$commitDeclined = $false
+try { Invoke-Submit }
+catch { $commitDeclined = $_.Exception.Message -like "Operation cancelled*" }
+Assert-True $commitDeclined "Declining the commit confirmation did not cancel Submit."
+Assert-Equal 0 $script:StagingInvocationCount "Submit staged files after the commit confirmation was declined."
+Assert-Equal 0 $script:PushInvocationCount "Submit pushed after the commit confirmation was declined."
+Assert-Equal 0 $script:MergeInvocationCount "Submit merged after the commit confirmation was declined."
 
 Write-Output "RELEASE_WORKFLOW_HEAD_SHA_REGRESSION_OK"
