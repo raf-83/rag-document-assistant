@@ -74,13 +74,34 @@ function Get-GhJson {
     if ($script:ChangedPathsApiMockFailure) {
         throw "GitHub CLI command failed (exit code: 1): changed-files API"
     }
-    return @("scripts/release-workflow.ps1", "docs/release-workflow.md")
+
+    $pages = New-Object object[] 2
+    $pages[0] = @(
+        [pscustomobject]@{
+            filename = "scripts/release-workflow.ps1"
+            previous_filename = $null
+        },
+        [pscustomobject]@{
+            filename = "docs/new-name.md"
+            previous_filename = "docs/old-name.md"
+        }
+    )
+    $pages[1] = @(
+        [pscustomobject]@{
+            filename = ".github/workflows/container-images.yml"
+            previous_filename = $null
+        }
+    )
+    Write-Output -NoEnumerate $pages
 }
 
 $apiPaths = @(Get-PullRequestChangedPaths -PullRequestNumber 3)
-Assert-Equal 2 $apiPaths.Count "Changed Pull Request paths were not returned."
+Assert-Equal 4 $apiPaths.Count "Changed Pull Request paths from all pages were not returned."
+Assert-True ($apiPaths -contains "docs/new-name.md") "The current name of a renamed file was not returned."
+Assert-True ($apiPaths -contains "docs/old-name.md") "The previous name of a renamed file was not returned."
 Assert-True ($script:ChangedPathsApiArguments -contains "--paginate") "The changed-files API lookup is not paginated."
 Assert-True ($script:ChangedPathsApiArguments -contains "--slurp") "Paginated changed-file results are not combined as JSON."
+Assert-True ($script:ChangedPathsApiArguments -notcontains "--jq") "The changed-files API lookup still combines the incompatible --slurp and --jq flags."
 $script:ChangedPathsApiMockFailure = $true
 $directApiFailureRejected = $false
 try { Get-PullRequestChangedPaths -PullRequestNumber 3 | Out-Null }

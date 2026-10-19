@@ -79,7 +79,7 @@ function Get-GhJson {
     $previousErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $output = & $script:GitHubCli @Arguments 2>$null
+        $output = @(& $script:GitHubCli @Arguments 2>&1)
         $exitCode = $LASTEXITCODE
     }
     finally {
@@ -91,7 +91,12 @@ function Get-GhJson {
             return $null
         }
 
-        throw "GitHub CLI command failed (exit code: $exitCode): gh $($Arguments -join ' '). Verify GitHub CLI authentication and network access."
+        $errorDetails = ($output | Out-String).Trim()
+        $message = "GitHub CLI command failed (exit code: $exitCode): gh $($Arguments -join ' ')."
+        if (-not [string]::IsNullOrWhiteSpace($errorDetails)) {
+            $message += " GitHub CLI output: $errorDetails"
+        }
+        throw $message
     }
 
     $text = ($output | Out-String).Trim()
@@ -490,20 +495,51 @@ function Get-PullRequestWorkflowRun {
 function Get-PullRequestChangedPaths {
     param([ValidateRange(1, [int]::MaxValue)][int]$PullRequestNumber)
 
-    $paths = @(Get-GhJson -Arguments @(
+    $pages = @(Get-GhJson -Arguments @(
         "api",
         "--paginate",
         "--slurp",
-        "repos/{owner}/{repo}/pulls/$PullRequestNumber/files?per_page=100",
-        "--jq", "add | map([.filename, .previous_filename] | map(select(. != null))) | add | unique"
+        "repos/{owner}/{repo}/pulls/$PullRequestNumber/files?per_page=100"
     ))
 
-    if ($paths.Count -eq 0) {
+    $files = [System.Collections.Generic.List[object]]::new()
+    $pendingItems = [System.Collections.Generic.Queue[object]]::new()
+    foreach ($page in $pages) {
+        $pendingItems.Enqueue($page)
+    }
+    while ($pendingItems.Count -gt 0) {
+        $item = $pendingItems.Dequeue()
+        if ($item -is [System.Array]) {
+            foreach ($nestedItem in $item) {
+                $pendingItems.Enqueue($nestedItem)
+            }
+            continue
+        }
+
+        [void]$files.Add($item)
+    }
+
+    if ($files.Count -eq 0) {
         throw "GitHub API returned no changed files for Pull Request #$PullRequestNumber. Workflow path filters cannot be evaluated safely."
     }
 
+    $paths = foreach ($file in $files) {
+        if ($null -eq $file) {
+            throw "GitHub API returned a null changed-file object for Pull Request #$PullRequestNumber."
+        }
+        $propertyNames = @($file.PSObject.Properties | ForEach-Object { $_.Name })
+        if ($propertyNames -notcontains "filename") {
+            throw "GitHub API returned an invalid changed-file object for Pull Request #$PullRequestNumber."
+        }
+
+        "$($file.filename)"
+        if ($propertyNames -contains "previous_filename" -and -not [string]::IsNullOrWhiteSpace("$($file.previous_filename)")) {
+            "$($file.previous_filename)"
+        }
+    }
+
     $validatedPaths = foreach ($path in $paths) {
-        $normalizedPath = "$path".Trim().Replace("\", "/")
+        $normalizedPath = $path.Trim().Replace("\", "/")
         if ([string]::IsNullOrWhiteSpace($normalizedPath) -or $normalizedPath.StartsWith("/") -or $normalizedPath.Contains("../")) {
             throw "GitHub API returned an invalid changed path for Pull Request #${PullRequestNumber}: '$path'."
         }
