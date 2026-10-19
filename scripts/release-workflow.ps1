@@ -7,12 +7,14 @@ param(
     [string]$Version = "0.1.0",
     [string]$Namespace = "rag-document-assistant",
     [string]$KubeContext = "",
-    [string]$CommitMessage = "feat: add portable Kubernetes deployment"
+    [string]$CommitMessage = "chore: submit current changes"
 )
 
 $ErrorActionPreference = "Stop"
 $script:RepositoryRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot "common/confirmation.ps1")
+. (Join-Path $PSScriptRoot "common/submit-proposal.ps1")
+$script:BranchParameterWasProvided = $PSBoundParameters.ContainsKey("Branch")
 $script:ContainerWorkflow = "container-images.yml"
 $script:BackendWorkflow = "backend-ci.yml"
 $script:GitHubCli = $null
@@ -77,7 +79,7 @@ function Get-GhJson {
     $previousErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $output = & $script:GitHubCli @Arguments 2>$null
+        $output = @(& $script:GitHubCli @Arguments 2>&1)
         $exitCode = $LASTEXITCODE
     }
     finally {
@@ -89,16 +91,26 @@ function Get-GhJson {
             return $null
         }
 
-        throw "GitHub CLI command failed: gh $($Arguments -join ' ')"
+        $errorDetails = ($output | Out-String).Trim()
+        $message = "GitHub CLI command failed (exit code: $exitCode): gh $($Arguments -join ' ')."
+        if (-not [string]::IsNullOrWhiteSpace($errorDetails)) {
+            $message += " GitHub CLI output: $errorDetails"
+        }
+        throw $message
     }
 
     $text = ($output | Out-String).Trim()
 
     if ([string]::IsNullOrWhiteSpace($text)) {
-        return $null
+        throw "GitHub CLI returned an empty response: gh $($Arguments -join ' ')"
     }
 
-    return $text | ConvertFrom-Json
+    try {
+        return $text | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "GitHub CLI returned invalid JSON: gh $($Arguments -join ' '). $($_.Exception.Message)"
+    }
 }
 
 function Assert-ExpectedBranch {
@@ -107,6 +119,22 @@ function Assert-ExpectedBranch {
     if ($LASTEXITCODE -ne 0 -or $currentBranch -ne $Branch) {
         throw "Run this workflow from branch '$Branch'. Current branch: '$currentBranch'."
     }
+}
+
+function Resolve-SubmitBranch {
+    $currentBranch = (& git --no-pager branch --show-current | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($currentBranch)) {
+        throw "Could not resolve the current Git branch."
+    }
+    if ($currentBranch -in @("main", "master")) {
+        throw "Submit requires a working branch. Refusing to submit directly from '$currentBranch'."
+    }
+
+    if (-not $script:BranchParameterWasProvided) {
+        $script:Branch = $currentBranch
+    }
+
+    Assert-ExpectedBranch
 }
 
 function Get-OriginRepository {
@@ -324,26 +352,90 @@ function Assert-GitHubCliReady {
     Invoke-Checked -FilePath $script:GitHubCli -Arguments @("auth", "status") -FailureMessage "GitHub CLI is not authenticated"
 }
 
+function ConvertTo-ValidatedPullRequest {
+    param(
+        [AllowNull()][object]$InputObject,
+        [int]$ExpectedNumber = 0
+    )
+
+    if ($null -eq $InputObject) {
+        throw "GitHub CLI returned an empty Pull Request object."
+    }
+
+    $propertyNames = @($InputObject.PSObject.Properties | ForEach-Object { $_.Name })
+    foreach ($propertyName in @("number", "state", "url", "mergeCommit", "headRefName", "headRefOid", "baseRefName")) {
+        if ($propertyNames -notcontains $propertyName) {
+            throw "GitHub CLI returned an incomplete Pull Request object. Missing property: $propertyName."
+        }
+    }
+
+    $number = 0
+    if (-not [int]::TryParse("$($InputObject.number)", [ref]$number) -or $number -le 0) {
+        throw "GitHub CLI returned an invalid Pull Request number."
+    }
+    if ($ExpectedNumber -gt 0 -and $number -ne $ExpectedNumber) {
+        throw "GitHub CLI returned Pull Request #$number while #$ExpectedNumber was requested."
+    }
+
+    $state = "$($InputObject.state)".Trim().ToUpperInvariant()
+    if ($state -notin @("OPEN", "CLOSED", "MERGED")) {
+        throw "GitHub CLI returned an invalid state for Pull Request #${number}: '$($InputObject.state)'."
+    }
+    if ([string]::IsNullOrWhiteSpace("$($InputObject.url)")) {
+        throw "GitHub CLI returned no URL for Pull Request #$number."
+    }
+    if ([string]::IsNullOrWhiteSpace("$($InputObject.headRefName)")) {
+        throw "GitHub CLI returned no source branch for Pull Request #$number."
+    }
+    if ([string]::IsNullOrWhiteSpace("$($InputObject.baseRefName)")) {
+        throw "GitHub CLI returned no target branch for Pull Request #$number."
+    }
+    if ("$($InputObject.headRefOid)" -notmatch "^[0-9a-fA-F]{40,64}$") {
+        throw "GitHub CLI returned an invalid head commit for Pull Request #$number."
+    }
+
+    return $InputObject
+}
+
 function Get-CurrentPullRequest {
-    $pullRequests = @(Get-GhJson -Arguments @(
+    $response = Get-GhJson -Arguments @(
         "pr", "list",
         "--head", $Branch,
         "--base", "main",
         "--state", "all",
         "--limit", "1",
         "--json", "number,state,url,mergeCommit,headRefName,headRefOid,baseRefName"
-    ))
+    )
+    $pullRequests = @($response)
 
-    return $pullRequests | Select-Object -First 1
+    if ($pullRequests.Count -eq 0) {
+        return $null
+    }
+    if ($pullRequests.Count -ne 1) {
+        throw "GitHub CLI returned $($pullRequests.Count) Pull Requests although at most one was requested."
+    }
+
+    $pullRequest = ConvertTo-ValidatedPullRequest -InputObject $pullRequests[0]
+    if ($pullRequest.headRefName -ne $Branch -or $pullRequest.baseRefName -ne "main") {
+        throw "GitHub CLI returned Pull Request #$($pullRequest.number) for '$($pullRequest.headRefName)' -> '$($pullRequest.baseRefName)', expected '$Branch' -> 'main'."
+    }
+
+    return $pullRequest
 }
 
 function Get-PullRequestByNumber {
-    param([int]$PullRequestNumber)
+    param([ValidateRange(1, [int]::MaxValue)][int]$PullRequestNumber)
 
-    return Get-GhJson -Arguments @(
+    $response = Get-GhJson -Arguments @(
         "pr", "view", "$PullRequestNumber",
         "--json", "number,state,url,mergeCommit,headRefName,headRefOid,baseRefName"
     )
+    $pullRequests = @($response)
+    if ($pullRequests.Count -ne 1) {
+        throw "GitHub CLI returned $($pullRequests.Count) Pull Request objects for requested Pull Request #$PullRequestNumber."
+    }
+
+    return ConvertTo-ValidatedPullRequest -InputObject $pullRequests[0] -ExpectedNumber $PullRequestNumber
 }
 
 function Wait-PullRequestHead {
@@ -400,6 +492,341 @@ function Get-PullRequestWorkflowRun {
         Select-Object -First 1
 }
 
+function Get-PullRequestChangedPaths {
+    param([ValidateRange(1, [int]::MaxValue)][int]$PullRequestNumber)
+
+    $pages = @(Get-GhJson -Arguments @(
+        "api",
+        "--paginate",
+        "--slurp",
+        "repos/{owner}/{repo}/pulls/$PullRequestNumber/files?per_page=100"
+    ))
+
+    $files = [System.Collections.Generic.List[object]]::new()
+    $pendingItems = [System.Collections.Generic.Queue[object]]::new()
+    foreach ($page in $pages) {
+        $pendingItems.Enqueue($page)
+    }
+    while ($pendingItems.Count -gt 0) {
+        $item = $pendingItems.Dequeue()
+        if ($item -is [System.Array]) {
+            foreach ($nestedItem in $item) {
+                $pendingItems.Enqueue($nestedItem)
+            }
+            continue
+        }
+
+        [void]$files.Add($item)
+    }
+
+    if ($files.Count -eq 0) {
+        throw "GitHub API returned no changed files for Pull Request #$PullRequestNumber. Workflow path filters cannot be evaluated safely."
+    }
+
+    $paths = foreach ($file in $files) {
+        if ($null -eq $file) {
+            throw "GitHub API returned a null changed-file object for Pull Request #$PullRequestNumber."
+        }
+        $propertyNames = @($file.PSObject.Properties | ForEach-Object { $_.Name })
+        if ($propertyNames -notcontains "filename") {
+            throw "GitHub API returned an invalid changed-file object for Pull Request #$PullRequestNumber."
+        }
+
+        "$($file.filename)"
+        if ($propertyNames -contains "previous_filename" -and -not [string]::IsNullOrWhiteSpace("$($file.previous_filename)")) {
+            "$($file.previous_filename)"
+        }
+    }
+
+    $validatedPaths = foreach ($path in $paths) {
+        $normalizedPath = $path.Trim().Replace("\", "/")
+        if ([string]::IsNullOrWhiteSpace($normalizedPath) -or $normalizedPath.StartsWith("/") -or $normalizedPath.Contains("../")) {
+            throw "GitHub API returned an invalid changed path for Pull Request #${PullRequestNumber}: '$path'."
+        }
+
+        $normalizedPath
+    }
+
+    return @($validatedPaths | Sort-Object -Unique)
+}
+
+function Get-WorkflowFileContentAtCommit {
+    param(
+        [string]$Workflow,
+        [string]$HeadSha
+    )
+
+    if ($Workflow -notmatch "^[A-Za-z0-9._-]+\.(?:yml|yaml)$") {
+        throw "Invalid GitHub Actions workflow file name: '$Workflow'."
+    }
+    if ($HeadSha -notmatch "^[0-9a-fA-F]{40,64}$") {
+        throw "Cannot inspect workflow '$Workflow' for invalid commit '$HeadSha'."
+    }
+
+    $workflowPath = ".github/workflows/$Workflow"
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $content = @(& git --no-pager show "${HeadSha}:$workflowPath" 2>$null)
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    if ($exitCode -ne 0) {
+        throw "Could not read workflow '$workflowPath' from Pull Request commit $HeadSha."
+    }
+
+    $text = $content -join [Environment]::NewLine
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        throw "Workflow '$workflowPath' is empty at Pull Request commit $HeadSha."
+    }
+
+    return $text
+}
+
+function ConvertFrom-WorkflowYamlListValue {
+    param(
+        [string]$Value,
+        [string]$Workflow,
+        [string]$FilterName
+    )
+
+    $trimmed = $Value.Trim()
+    if ($trimmed -match "^'(?<value>(?:[^']|'')*)'\s*(?:#.*)?$") {
+        return $Matches.value.Replace("''", "'")
+    }
+    if ($trimmed -match '^"(?<value>(?:[^"\\]|\\.)*)"\s*(?:#.*)?$') {
+        return [System.Text.RegularExpressions.Regex]::Unescape($Matches.value)
+    }
+    if ($trimmed -match "^(?<value>.*?)(?:\s+#.*)?$") {
+        return $Matches.value.Trim()
+    }
+
+    throw "Could not parse '$FilterName' in workflow '$Workflow': $Value"
+}
+
+function Get-WorkflowPullRequestPathFilters {
+    param(
+        [string]$Workflow,
+        [string]$Content
+    )
+
+    $lines = @($Content -split "\r?\n")
+    $onLineIndex = -1
+    $onIndent = -1
+
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        $line = $lines[$index]
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith("#")) {
+            continue
+        }
+
+        $indent = $line.Length - $line.TrimStart().Length
+        if ($indent -eq 0 -and $line.Trim() -match '^(?:on|''on''|"on")\s*:\s*$') {
+            $onLineIndex = $index
+            $onIndent = $indent
+            break
+        }
+    }
+
+    if ($onLineIndex -lt 0) {
+        throw "Could not find the GitHub Actions 'on' mapping in workflow '$Workflow'."
+    }
+
+    $pullRequestLineIndex = -1
+    $pullRequestIndent = -1
+    for ($index = $onLineIndex + 1; $index -lt $lines.Count; $index++) {
+        $line = $lines[$index]
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith("#")) {
+            continue
+        }
+
+        $indent = $line.Length - $line.TrimStart().Length
+        if ($indent -le $onIndent) {
+            break
+        }
+        if ($line.Trim() -match '^(?:pull_request|''pull_request''|"pull_request")\s*:\s*(?<value>.*)$') {
+            $inlineValue = $Matches.value.Trim()
+            if (-not [string]::IsNullOrWhiteSpace($inlineValue) -and $inlineValue -ne "{}") {
+                throw "Unsupported inline pull_request configuration in workflow '$Workflow'."
+            }
+            $pullRequestLineIndex = $index
+            $pullRequestIndent = $indent
+            break
+        }
+    }
+
+    if ($pullRequestLineIndex -lt 0) {
+        throw "Workflow '$Workflow' is required by Submit but has no pull_request trigger."
+    }
+
+    $filters = @{
+        Paths = @()
+        PathsIgnore = @()
+    }
+
+    for ($index = $pullRequestLineIndex + 1; $index -lt $lines.Count; $index++) {
+        $line = $lines[$index]
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith("#")) {
+            continue
+        }
+
+        $indent = $line.Length - $line.TrimStart().Length
+        if ($indent -le $pullRequestIndent) {
+            break
+        }
+        if ($line.Trim() -notmatch '^(?<name>paths|paths-ignore)\s*:\s*(?<inline>.*)$') {
+            continue
+        }
+
+        $filterName = $Matches.name
+        if (-not [string]::IsNullOrWhiteSpace($Matches.inline)) {
+            throw "Unsupported inline '$filterName' configuration in workflow '$Workflow'. Use a YAML list so Submit can evaluate it safely."
+        }
+
+        $filterIndent = $indent
+        $values = @()
+        for ($valueIndex = $index + 1; $valueIndex -lt $lines.Count; $valueIndex++) {
+            $valueLine = $lines[$valueIndex]
+            if ([string]::IsNullOrWhiteSpace($valueLine) -or $valueLine.TrimStart().StartsWith("#")) {
+                continue
+            }
+
+            $valueIndent = $valueLine.Length - $valueLine.TrimStart().Length
+            if ($valueIndent -le $filterIndent) {
+                break
+            }
+            if ($valueLine.Trim() -notmatch '^\-\s+(?<value>.+)$') {
+                throw "Could not parse '$filterName' in workflow '$Workflow': $($valueLine.Trim())"
+            }
+
+            $values += ConvertFrom-WorkflowYamlListValue -Value $Matches.value -Workflow $Workflow -FilterName $filterName
+            $index = $valueIndex
+        }
+
+        if ($values.Count -eq 0) {
+            throw "Workflow '$Workflow' contains an empty '$filterName' list."
+        }
+
+        if ($filterName -eq "paths") {
+            $filters.Paths = @($values)
+        }
+        else {
+            $filters.PathsIgnore = @($values)
+        }
+    }
+
+    if ($filters.Paths.Count -gt 0 -and $filters.PathsIgnore.Count -gt 0) {
+        throw "Workflow '$Workflow' contains both 'paths' and 'paths-ignore' for pull_request."
+    }
+
+    return [pscustomobject]$filters
+}
+
+function ConvertTo-GitHubPathRegex {
+    param(
+        [string]$Pattern,
+        [string]$Workflow
+    )
+
+    $builder = [System.Text.StringBuilder]::new("^")
+    for ($index = 0; $index -lt $Pattern.Length; $index++) {
+        $character = $Pattern[$index]
+        if ($character -eq "*") {
+            if ($index + 1 -lt $Pattern.Length -and $Pattern[$index + 1] -eq "*") {
+                $index++
+                if ($index + 1 -lt $Pattern.Length -and $Pattern[$index + 1] -eq "/") {
+                    [void]$builder.Append("(?:.*/)?")
+                    $index++
+                }
+                else {
+                    [void]$builder.Append(".*")
+                }
+            }
+            else {
+                [void]$builder.Append("[^/]*")
+            }
+            continue
+        }
+        if ($character -eq "?") {
+            [void]$builder.Append("[^/]")
+            continue
+        }
+        if ($character -in @("[", "]", "+")) {
+            throw "Unsupported advanced pull_request path pattern '$Pattern' in workflow '$Workflow'."
+        }
+
+        [void]$builder.Append([System.Text.RegularExpressions.Regex]::Escape("$character"))
+    }
+
+    [void]$builder.Append("$")
+    return $builder.ToString()
+}
+
+function Test-PathMatchesWorkflowPatterns {
+    param(
+        [string]$Path,
+        [string[]]$Patterns,
+        [string]$Workflow,
+        [switch]$AllowNegation
+    )
+
+    $matches = $false
+    foreach ($configuredPattern in $Patterns) {
+        $pattern = "$configuredPattern"
+        $negative = $pattern.StartsWith("!")
+        if ($negative) {
+            if (-not $AllowNegation) {
+                throw "Negative path pattern '$pattern' is not supported in paths-ignore for workflow '$Workflow'."
+            }
+            $pattern = $pattern.Substring(1)
+        }
+        if ([string]::IsNullOrWhiteSpace($pattern)) {
+            throw "Workflow '$Workflow' contains an empty pull_request path pattern."
+        }
+
+        $regex = ConvertTo-GitHubPathRegex -Pattern $pattern -Workflow $Workflow
+        if ($Path -match $regex) {
+            $matches = -not $negative
+        }
+    }
+
+    return $matches
+}
+
+function Test-WorkflowRunsForPullRequest {
+    param(
+        [string]$Workflow,
+        [string]$HeadSha,
+        [string[]]$ChangedPaths
+    )
+
+    $content = Get-WorkflowFileContentAtCommit -Workflow $Workflow -HeadSha $HeadSha
+    $filters = Get-WorkflowPullRequestPathFilters -Workflow $Workflow -Content $content
+
+    if ($filters.Paths.Count -gt 0) {
+        foreach ($path in $ChangedPaths) {
+            if (Test-PathMatchesWorkflowPatterns -Path $path -Patterns $filters.Paths -Workflow $Workflow -AllowNegation) {
+                return $true
+            }
+        }
+        return $false
+    }
+
+    if ($filters.PathsIgnore.Count -gt 0) {
+        foreach ($path in $ChangedPaths) {
+            if (-not (Test-PathMatchesWorkflowPatterns -Path $path -Patterns $filters.PathsIgnore -Workflow $Workflow)) {
+                return $true
+            }
+        }
+        return $false
+    }
+
+    return $true
+}
+
 function Wait-PullRequestChecks {
     param(
         [int]$PullRequestNumber,
@@ -412,6 +839,17 @@ function Wait-PullRequestChecks {
         throw "Could not resolve the current head commit for Pull Request #$PullRequestNumber."
     }
 
+    $changedPaths = @(Get-PullRequestChangedPaths -PullRequestNumber $PullRequestNumber)
+    $requiredWorkflows = @()
+    foreach ($requiredWorkflow in $script:RequiredPullRequestWorkflows) {
+        if (Test-WorkflowRunsForPullRequest -Workflow $requiredWorkflow.File -HeadSha $HeadSha -ChangedPaths $changedPaths) {
+            $requiredWorkflows += $requiredWorkflow
+        }
+        else {
+            Write-Host "Skipping Pull Request workflow '$($requiredWorkflow.Name)' because its path filters do not match the changed files."
+        }
+    }
+
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $lastStatusMessage = ""
 
@@ -421,7 +859,7 @@ function Wait-PullRequestChecks {
         $failed = @()
         $passed = @()
 
-        foreach ($requiredWorkflow in $script:RequiredPullRequestWorkflows) {
+        foreach ($requiredWorkflow in $requiredWorkflows) {
             $run = Get-PullRequestWorkflowRun -Workflow $requiredWorkflow.File -HeadSha $HeadSha
 
             if ($null -eq $run) {
@@ -483,7 +921,7 @@ function Wait-PullRequestChecks {
 }
 
 function Invoke-Submit {
-    Assert-ExpectedBranch
+    Resolve-SubmitBranch
     Assert-GitHubCliReady
 
     $pullRequest = Get-CurrentPullRequest
@@ -494,6 +932,7 @@ function Invoke-Submit {
 
         if ($pullRequest.state -eq "MERGED") {
             Write-Host "Pull Request is already merged."
+            Remove-SubmitProposalState
             return
         }
 
@@ -502,45 +941,56 @@ function Invoke-Submit {
         }
     }
 
-    $changes = @(& git --no-pager status --porcelain)
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not read Git status."
-    }
+    Assert-LocalSecretFilesAreUntracked
+    Invoke-SecretPatternCheck
+    $candidatePaths = @(Get-SubmitCandidatePaths -RepositoryRoot $script:RepositoryRoot)
+    $proposal = $null
 
-    if ($changes.Count -gt 0) {
-        Write-Step "Changes proposed for the commit"
-        & git --no-pager status --short
+    if ($candidatePaths.Count -gt 0) {
+        Write-Step "Preparing a commit and Pull Request proposal"
+        $proposal = Get-ApprovedSubmitProposal `
+            -CandidatePaths $candidatePaths `
+            -RepositoryRoot $script:RepositoryRoot `
+            -DefaultCommitMessage $CommitMessage
 
         $commitDetails = @(
             "Repository: $(Get-OriginRepository)",
             "Working tree: $script:RepositoryRoot",
             "Branch: $Branch",
-            "Commit message: $CommitMessage"
+            "Files: $($proposal.Files -join ', ')",
+            "Commit message: $($proposal.CommitMessage)"
         )
         if ($continuingExistingPullRequest) {
             $commitDetails += "Pull Request: #$($pullRequest.number) will be updated only after the separately confirmed push."
         }
 
         Confirm-Action `
-            -Operation "Stage every file listed above and create one local commit." `
+            -Operation "Stage only the accepted files and create one local commit." `
             -Details $commitDetails
 
-        Invoke-Checked -FilePath "git" -Arguments @("--no-pager", "add", "--all") -FailureMessage "git add failed"
+        Set-SubmitStagingSelection -SelectedPaths $proposal.Files
         Assert-LocalSecretFilesAreUntracked
         Invoke-SecretPatternCheck
         Invoke-Checked -FilePath "git" -Arguments @("--no-pager", "diff", "--cached", "--check") -FailureMessage "Staged whitespace check failed"
 
         Write-Step "Staged files"
         & git --no-pager diff --cached --name-status
-        Invoke-Checked -FilePath "git" -Arguments @("--no-pager", "commit", "-m", $CommitMessage) -FailureMessage "git commit failed"
+        Invoke-Checked -FilePath "git" -Arguments @("--no-pager", "commit", "-m", $proposal.CommitMessage) -FailureMessage "git commit failed"
     }
     else {
-        Write-Host "Working tree is clean; no commit is needed."
+        Write-Host "No eligible working-tree changes require a commit. Ignored, secret, and local-report paths are never submitted."
     }
 
     $localHeadSha = (& git --no-pager rev-parse HEAD | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($localHeadSha)) {
         throw "Could not resolve the local HEAD commit."
+    }
+
+    if ($null -ne $proposal) {
+        Save-SubmitProposalState -Proposal $proposal -Branch $Branch -HeadSha $localHeadSha
+    }
+    else {
+        $proposal = Get-SubmitProposalState -Branch $Branch -HeadSha $localHeadSha
     }
 
     $remoteName = (& git --no-pager config --get "branch.$Branch.remote" | Out-String).Trim()
@@ -584,36 +1034,31 @@ function Invoke-Submit {
     }
 
     if ($null -eq $pullRequest) {
+        if ($null -eq $proposal) {
+            $headSubject = (& git --no-pager log -1 --pretty=%s | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($headSubject)) {
+                throw "Could not resolve a default Pull Request title from HEAD."
+            }
+            $proposal = New-ManualSubmitPullRequestMetadata -DefaultTitle $headSubject
+            Show-SubmitProposal -Proposal $proposal
+        }
+
         Confirm-Action `
             -Operation "Create a Pull Request." `
             -Details @(
                 "Repository: $(Get-OriginRepository)",
                 "Source branch: $Branch",
-                "Target branch: main"
+                "Target branch: main",
+                "Pull Request title: $($proposal.PullRequestTitle)",
+                "Pull Request body:`n$($proposal.PullRequestBody)"
             )
-
-        $prBody = @"
-## Summary
-
-- add repeatable Kubernetes deployment for PostgreSQL, backend and frontend
-- publish versioned backend and frontend images to GHCR
-- keep frontend health checks and Origin validation suitable for local port-forward and future HTTPS
-
-## Validation
-
-- backend unit tests
-- frontend lint, typecheck and production build
-- Docker Compose configuration validation
-- Kubernetes manifest rendering
-- GitHub Actions lint
-"@
 
         Invoke-Checked -FilePath $script:GitHubCli -Arguments @(
             "pr", "create",
             "--base", "main",
             "--head", $Branch,
-            "--title", "feat: add portable Kubernetes deployment",
-            "--body", $prBody
+            "--title", $proposal.PullRequestTitle,
+            "--body", $proposal.PullRequestBody
         ) -FailureMessage "Pull Request creation failed"
 
         $pullRequest = Get-CurrentPullRequest
@@ -687,6 +1132,7 @@ function Invoke-Submit {
     }
 
     Write-Host "Pull Request merged as $($mergedPullRequest.mergeCommit.oid)."
+    Remove-SubmitProposalState
 }
 
 function Resolve-VerifiedReleaseCommit {

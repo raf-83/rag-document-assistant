@@ -24,14 +24,20 @@ From the repository root:
 .\scripts\release-workflow.ps1 -Stage <All|Validate|Submit|Release|Deploy|Verify> -Branch <working-branch> -Version <semantic-version> -Namespace rag-document-assistant -KubeContext <context-name> -CommitMessage "<message>"
 ```
 
-Pass the actual working branch and intended version rather than relying on the release-specific defaults in the script. Parameters do not update Kubernetes image references; those remain version-pinned in the manifests.
+For intelligent submission from the current branch, the minimal command is:
+
+```powershell
+.\scripts\release-workflow.ps1 -Stage Submit
+```
+
+`Submit` infers the current branch when `-Branch` is omitted, refuses `main`/`master`, and still verifies an explicitly supplied branch. For the other stages, pass the actual working branch and intended version rather than relying on release-specific defaults. Parameters do not update Kubernetes image references; those remain version-pinned in the manifests.
 
 ## Stages
 
 | Stage | What it does | External changes |
 | --- | --- | --- |
 | `Validate` | Checks prerequisites and expected branch; checks whitespace and common secret patterns; runs backend tests, frontend lint/type/build, Compose validation, Kustomize rendering, and Actionlint | None |
-| `Submit` | Creates a local commit when needed, pushes the branch, opens or resumes a Pull Request to `main`, waits for required PR workflow runs on the exact head commit, and offers squash merge | Git and GitHub, each behind a confirmation |
+| `Submit` | Uses Codex CLI or manual fallback to prepare a bounded commit/PR proposal, creates a local commit when needed, pushes the branch, opens or resumes a Pull Request to `main`, waits for required PR workflow runs on the exact head commit, and offers squash merge | Git and GitHub, each behind a confirmation |
 | `Release` | Resolves identical local/remote `main`, waits for required main checks, creates a GitHub Release and tag if absent, waits for image publication, verifies anonymous image access and provenance | GitHub release/tag; no Kubernetes change |
 | `Deploy` | Verifies public release images, resolves the selected context, creates/updates the namespace and both Secrets, applies Kustomize resources, then invokes verification | Selected Kubernetes context and namespace, behind confirmations |
 | `Verify` | Waits for all three rollouts, checks PostgreSQL readiness and frontend/backend health, and prints the port-forward command | Read-only checks against the cluster |
@@ -61,7 +67,7 @@ A declined answer throws an operation-cancelled error before the guarded command
 
 The guarded operations include:
 
-- staging and committing the displayed working-tree files;
+- staging only the accepted proposal files and committing them;
 - pushing the selected branch;
 - creating a Pull Request;
 - squash merging after required checks pass;
@@ -70,7 +76,7 @@ The guarded operations include:
 - applying the Kubernetes deployment;
 - synchronizing `backend-secret` and `postgres-secret`.
 
-The regression coverage for approval and denial is in `scripts/tests/confirmation-regression.ps1`. Additional workflow regression scripts protect exact PR-head and `main`-history checks.
+The regression coverage for approval and denial is in `scripts/tests/confirmation-regression.ps1`. `scripts/tests/submit-proposal-regression.ps1` covers proposal parsing, manual fallback, editing, regeneration, cancellation, safe path selection, untracked and ignored files, exact staging, and resumable state. `scripts/tests/release-workflow-check-filters-regression.ps1` covers filtered docs/scripts Pull Requests, applicable backend/frontend changes, missing, pending, and failed runs, and API failures. Additional workflow regression scripts protect exact PR-head and `main`-history checks.
 
 ## Validate
 
@@ -90,12 +96,36 @@ Validation does not release or deploy.
 
 ## Submit
 
-`Submit` uses authenticated GitHub CLI access. It displays the candidate files before asking to stage and commit. Push, PR creation, and squash merge each have a separate confirmation. The stage waits for these workflow files on the exact Pull Request head SHA:
+`Submit` uses authenticated GitHub CLI access and optionally Codex CLI. It first derives candidate paths from tracked diffs, the index, and untracked files reported by Git with standard ignore rules applied. Known local reports, local Secret files, environment files, private-key files, paths outside the repository, and files containing common credential formats are excluded before any content is prepared for Codex. Secret values are never displayed.
+
+When Codex CLI is available, the script:
+
+1. builds an in-memory, size-limited context only from the filtered candidates;
+2. redacts credential-like assignments as an additional safeguard;
+3. runs `codex exec` in an isolated temporary directory with the shell tool disabled, `--sandbox read-only`, `--ephemeral`, and `--ignore-user-config`;
+4. requests a JSON Schema-constrained response through `--output-schema` and reads only `--output-last-message`;
+5. accepts only a file list, commit message, Pull Request title, and Pull Request body with `Summary` and `Tests` sections;
+6. validates every returned path again against the current candidate set.
+
+The prompt supplies the change context directly, so Codex is not started in the repository and is instructed not to inspect the filesystem or propose commands. The script never evaluates model output as PowerShell or shell input. If Codex is missing, exits unsuccessfully, or returns invalid JSON, Submit switches to manual proposal entry.
+
+The displayed proposal can be accepted (`a`), edited (`e`), regenerated (`r`), or cancelled (`c`). This proposal menu does not itself change repository state. After acceptance, the existing strict `(y/n)` gates remain separate for:
+
+- staging exactly the selected paths and creating the commit;
+- pushing the branch;
+- creating the Pull Request;
+- squash merging after CI.
+
+Pre-staged paths that are not selected are removed from the index without changing their working-tree content. Submit verifies that the final staged set exactly equals the accepted file list; it does not use `git add --all`. After a successful commit, the accepted PR metadata is stored under the repository's private Git metadata directory. A rerun for the same branch and HEAD can resume after an interrupted commit or push without regenerating inconsistent PR text; state for another branch or commit is ignored.
+
+The stage evaluates the `pull_request` path filters in these workflow files at the exact Pull Request head SHA:
 
 - `.github/workflows/backend-ci.yml`;
 - `.github/workflows/container-images.yml`.
 
-It refuses to merge when a required run is missing, pending beyond the timeout, failed, or associated with a different head commit. The merge strategy is squash.
+Changed paths are read from the Pull Request API. A workflow excluded by its configured `paths` or `paths-ignore` filters is not awaited; a workflow whose filters match remains required even before GitHub reports its run. API, workflow-reading, or filter-parsing errors stop Submit instead of being treated as skipped checks.
+
+For every applicable workflow, Submit refuses to merge when a required run is missing, pending beyond the timeout, failed, or associated with a different head commit. It rechecks the PR head and CI immediately before calling GitHub CLI with `--match-head-commit`. The merge strategy is squash.
 
 ## Release and container publication
 
