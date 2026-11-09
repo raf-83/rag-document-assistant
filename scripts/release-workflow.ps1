@@ -968,7 +968,7 @@ function Invoke-Submit {
             -Operation "Stage only the accepted files and create one local commit." `
             -Details $commitDetails
 
-        Set-SubmitStagingSelection -SelectedPaths $proposal.Files
+        Set-SubmitStagingSelection -SelectedPaths $proposal.Files -RepositoryRoot $script:RepositoryRoot
         Assert-LocalSecretFilesAreUntracked
         Invoke-SecretPatternCheck
         Invoke-Checked -FilePath "git" -Arguments @("--no-pager", "diff", "--cached", "--check") -FailureMessage "Staged whitespace check failed"

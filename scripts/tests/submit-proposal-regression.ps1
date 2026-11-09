@@ -47,7 +47,11 @@ try {
         [System.IO.File]::WriteAllText((Join-Path $testRoot ".gitignore"), "ignored.txt`n.env`n")
         [System.IO.File]::WriteAllText((Join-Path $testRoot "tracked.txt"), "base`n")
         [System.IO.File]::WriteAllText((Join-Path $testRoot "staged.txt"), "base`n")
-        Invoke-TestGit -Arguments @("add", "--", ".gitignore", "tracked.txt", "staged.txt")
+        [System.IO.File]::WriteAllText((Join-Path $testRoot "tracked-secret.key"), "test-only secret placeholder`n")
+        [void](New-Item -ItemType Directory -Path (Join-Path $testRoot "docs") -Force)
+        [System.IO.File]::WriteAllText((Join-Path $testRoot "docs/intelligent-submit-workflow-filter-fix-report.md"), "tracked local report`n")
+        [System.IO.File]::WriteAllText((Join-Path $testRoot "docs/intelligent-submit-pr-detection-fix-report.md"), "tracked local report`n")
+        Invoke-TestGit -Arguments @("add", "--", ".gitignore", "tracked.txt", "staged.txt", "tracked-secret.key", "docs/intelligent-submit-workflow-filter-fix-report.md", "docs/intelligent-submit-pr-detection-fix-report.md")
         Invoke-TestGit -Arguments @("commit", "--quiet", "-m", "test base")
 
         $workflowPath = Join-Path $projectRoot "scripts/release-workflow.ps1"
@@ -74,13 +78,19 @@ try {
         Resolve-SubmitBranch
         Assert-Equal "feature/test" $Branch "Submit did not infer the current working branch."
 
+        [System.IO.File]::AppendAllText((Join-Path $testRoot ".gitignore"), "docs/intelligent-submit-workflow-filter-fix-report.md`n")
         [System.IO.File]::WriteAllText((Join-Path $testRoot "tracked.txt"), "changed`n")
         [System.IO.File]::WriteAllText((Join-Path $testRoot "staged.txt"), "staged change`n")
         [System.IO.File]::WriteAllText((Join-Path $testRoot "untracked.txt"), "new file`n")
         [System.IO.File]::WriteAllText((Join-Path $testRoot "ignored.txt"), "ignored`n")
         [System.IO.File]::WriteAllText((Join-Path $testRoot ".env"), "PASSWORD=not-for-codex`n")
-        [void](New-Item -ItemType Directory -Path (Join-Path $testRoot "docs") -Force)
         [System.IO.File]::WriteAllText((Join-Path $testRoot "docs/final-project-documentation-report.md"), "local report`n")
+        [System.IO.File]::WriteAllText((Join-Path $testRoot "docs/intelligent-submit-pr-detection-fix-report.md"), "modified tracked local report`n")
+        Remove-Item -LiteralPath (Join-Path $testRoot "docs/intelligent-submit-workflow-filter-fix-report.md")
+        [System.IO.File]::WriteAllText((Join-Path $testRoot "docs/intelligent-submit-local-preparation-report.md"), "staged-only local report`n")
+        Invoke-TestGit -Arguments @("add", "--", "docs/intelligent-submit-local-preparation-report.md")
+        Remove-Item -LiteralPath (Join-Path $testRoot "docs/intelligent-submit-local-preparation-report.md")
+        Remove-Item -LiteralPath (Join-Path $testRoot "tracked-secret.key")
         $fakeSecret = "sk-" + ("a" * 26)
         [System.IO.File]::WriteAllText((Join-Path $testRoot "leak.txt"), "token=$fakeSecret`n")
         Invoke-TestGit -Arguments @("add", "--", "staged.txt")
@@ -92,6 +102,10 @@ try {
         Assert-True ($candidatePaths -notcontains "ignored.txt") "An ignored file was offered to Codex."
         Assert-True ($candidatePaths -notcontains ".env") "An ignored secret file was offered to Codex."
         Assert-True ($candidatePaths -notcontains "docs/final-project-documentation-report.md") "A local report was offered to Codex."
+        Assert-True ($candidatePaths -notcontains "docs/intelligent-submit-pr-detection-fix-report.md") "A modified tracked local report was offered to Codex."
+        Assert-True ($candidatePaths -notcontains "docs/intelligent-submit-local-preparation-report.md") "A report added only to the index and then removed was treated as a previously tracked deletion."
+        Assert-True ($candidatePaths -contains "docs/intelligent-submit-workflow-filter-fix-report.md") "The tracked deletion of a local report was not offered."
+        Assert-True ($candidatePaths -notcontains "tracked-secret.key") "Deletion of a tracked secret path was offered to Codex."
         Assert-True ($candidatePaths -notcontains "leak.txt") "A file containing a common secret format was offered to Codex."
 
         $codexContext = Get-SubmitCodexContext -CandidatePaths $candidatePaths -RepositoryRoot $testRoot
@@ -109,6 +123,16 @@ try {
         $validProposal = ConvertFrom-SubmitProposalJson -Json $validJson -CandidatePaths $candidatePaths -RepositoryRoot $testRoot
         Assert-Equal 2 $validProposal.Files.Count "A valid structured proposal lost files."
         Assert-Equal "test: cover intelligent submit" $validProposal.CommitMessage "The commit message changed while parsing."
+
+        $deletedReportPath = "docs/intelligent-submit-workflow-filter-fix-report.md"
+        $deletedReportJson = @{
+            files = @($deletedReportPath)
+            commitMessage = "chore: remove local report"
+            pullRequestTitle = "chore: remove local report"
+            pullRequestBody = "## Summary`n`n- remove a local report`n`n## Tests`n`n- regression test"
+        } | ConvertTo-Json -Depth 4
+        $deletedReportProposal = ConvertFrom-SubmitProposalJson -Json $deletedReportJson -CandidatePaths $candidatePaths -RepositoryRoot $testRoot
+        Assert-Equal $deletedReportPath $deletedReportProposal.Files[0] "Codex proposal validation rejected a tracked local-report deletion."
 
         $invalidJsonRejected = $false
         try { ConvertFrom-SubmitProposalJson -Json "{broken" -CandidatePaths $candidatePaths -RepositoryRoot $testRoot | Out-Null }
@@ -145,6 +169,15 @@ try {
         $edited = Edit-SubmitProposal -Proposal $validProposal -CandidatePaths $candidatePaths -RepositoryRoot $testRoot
         Assert-Equal "test: edited proposal" $edited.CommitMessage "Proposal editing did not update the commit message."
         Assert-Equal $validProposal.PullRequestTitle $edited.PullRequestTitle "Enter should keep the current PR title."
+
+        $deletedReportSelection = [Array]::IndexOf($candidatePaths, $deletedReportPath) + 1
+        Assert-True ($deletedReportSelection -gt 0) "The deleted local report is missing from manual selection candidates."
+        $script:ReadHostResponses = [System.Collections.Generic.Queue[string]]::new()
+        foreach ($response in @("$deletedReportSelection", "chore: remove local report", "", "remove local report", "regression test")) {
+            $script:ReadHostResponses.Enqueue($response)
+        }
+        $manualDeletedReportProposal = New-ManualSubmitProposal -CandidatePaths $candidatePaths -RepositoryRoot $testRoot
+        Assert-Equal $deletedReportPath $manualDeletedReportProposal.Files[0] "Manual proposal validation rejected a tracked local-report deletion."
 
         function Resolve-CodexCli { return $null }
         function New-ManualSubmitProposal {
@@ -188,7 +221,11 @@ try {
         Get-ApprovedSubmitProposal -CandidatePaths $candidatePaths -RepositoryRoot $testRoot | Out-Null
         Assert-Equal 2 $script:CodexProposalInvocationCount "Regenerate did not request a fresh Codex proposal."
 
-        Set-SubmitStagingSelection -SelectedPaths @("tracked.txt", "untracked.txt")
+        Set-SubmitStagingSelection -SelectedPaths @($deletedReportPath) -RepositoryRoot $testRoot
+        $stagedDeletionPaths = @(Get-SubmitStagedPaths | Sort-Object)
+        Assert-Equal $deletedReportPath ($stagedDeletionPaths -join "`n") "Exact staging did not preserve the selected local-report deletion."
+
+        Set-SubmitStagingSelection -SelectedPaths @("tracked.txt", "untracked.txt") -RepositoryRoot $testRoot
         $stagedPaths = @(Get-SubmitStagedPaths | Sort-Object)
         Assert-Equal "tracked.txt`nuntracked.txt" ($stagedPaths -join "`n") "Staging included files outside the accepted selection."
 
@@ -210,6 +247,46 @@ try {
         foreach ($requiredOption in @('--sandbox", "read-only', '--disable", "shell_tool', '--ephemeral', '--ignore-user-config', '--output-schema', '--output-last-message')) {
             Assert-True ($helperText.Contains($requiredOption)) "Codex invocation is missing: $requiredOption"
         }
+
+        Invoke-TestGit -Arguments @("add", "--update", "--", "docs/intelligent-submit-workflow-filter-fix-report.md")
+        Invoke-TestGit -Arguments @("commit", "--quiet", "-m", "remove local report")
+        [System.IO.File]::WriteAllText((Join-Path $testRoot "docs/intelligent-submit-workflow-filter-fix-report.md"), "recreated local report`n")
+        $postDeletionCandidates = @(Get-SubmitCandidatePaths -RepositoryRoot $testRoot)
+        Assert-True ($postDeletionCandidates -notcontains "docs/intelligent-submit-workflow-filter-fix-report.md") "A recreated local report was offered again after its tracked deletion."
+
+        $recreatedReportRejected = $false
+        try { ConvertFrom-SubmitProposalJson -Json $deletedReportJson -CandidatePaths @($deletedReportPath) -RepositoryRoot $testRoot | Out-Null }
+        catch { $recreatedReportRejected = $_.Exception.Message -like "The proposal contains an excluded path*" }
+        Assert-True $recreatedReportRejected "Proposal validation accepted an added or modified excluded report."
+
+        $recreatedReportStagingRejected = $false
+        try { Set-SubmitStagingSelection -SelectedPaths @($deletedReportPath) -RepositoryRoot $testRoot }
+        catch { $recreatedReportStagingRejected = $_.Exception.Message -like "Refusing to stage an excluded path*" }
+        Assert-True $recreatedReportStagingRejected "Staging accepted an added or modified excluded report."
+
+        $modifiedReportPath = "docs/intelligent-submit-pr-detection-fix-report.md"
+        $modifiedReportJson = $deletedReportJson.Replace($deletedReportPath, $modifiedReportPath)
+        $modifiedReportRejected = $false
+        try { ConvertFrom-SubmitProposalJson -Json $modifiedReportJson -CandidatePaths @($modifiedReportPath) -RepositoryRoot $testRoot | Out-Null }
+        catch { $modifiedReportRejected = $_.Exception.Message -like "The proposal contains an excluded path*" }
+        Assert-True $modifiedReportRejected "Proposal validation accepted a modified excluded report."
+
+        $indexOnlyReportPath = "docs/intelligent-submit-local-preparation-report.md"
+        $indexOnlyReportJson = $deletedReportJson.Replace($deletedReportPath, $indexOnlyReportPath)
+        $indexOnlyReportRejected = $false
+        try { ConvertFrom-SubmitProposalJson -Json $indexOnlyReportJson -CandidatePaths @($indexOnlyReportPath) -RepositoryRoot $testRoot | Out-Null }
+        catch { $indexOnlyReportRejected = $_.Exception.Message -like "The proposal contains an excluded path*" }
+        Assert-True $indexOnlyReportRejected "Proposal validation accepted deletion of a report that was never tracked in HEAD."
+
+        $secretDeletionRejected = $false
+        try { ConvertFrom-SubmitProposalJson -Json $deletedReportJson.Replace($deletedReportPath, "tracked-secret.key") -CandidatePaths @("tracked-secret.key") -RepositoryRoot $testRoot | Out-Null }
+        catch { $secretDeletionRejected = $_.Exception.Message -like "The proposal contains an excluded path*" }
+        Assert-True $secretDeletionRejected "Proposal validation accepted deletion of an excluded secret path."
+
+        $secretDeletionStagingRejected = $false
+        try { Set-SubmitStagingSelection -SelectedPaths @("tracked-secret.key") -RepositoryRoot $testRoot }
+        catch { $secretDeletionStagingRejected = $_.Exception.Message -like "Refusing to stage an excluded path*" }
+        Assert-True $secretDeletionStagingRejected "Staging accepted deletion of an excluded secret path."
     }
     finally {
         Pop-Location

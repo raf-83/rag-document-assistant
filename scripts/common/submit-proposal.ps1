@@ -3,8 +3,11 @@ $script:SubmitLocalReportPaths = @(
     "docs/final-project-documentation-report.md",
     "docs/intelligent-submit-implementation-report.md",
     "docs/intelligent-submit-live-integration-test-report.md",
+    "docs/intelligent-submit-local-preparation-report.md",
     "docs/intelligent-submit-pr-detection-fix-report.md",
-    "docs/public-v0.1.0-repository-preparation-report.md"
+    "docs/intelligent-submit-workflow-filter-fix-report.md",
+    "docs/public-v0.1.0-repository-preparation-report.md",
+    "docs/submit-local-report-deletion-validation-fix-report.md"
 )
 
 $script:SubmitSecretPathPatterns = @(
@@ -63,6 +66,45 @@ function Test-SubmitPathIsExcluded {
     }
 
     return $false
+}
+
+function Test-SubmitPathIsTrackedDeletion {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$RepositoryRoot
+    )
+
+    $normalized = ConvertTo-SubmitRepositoryPath -Path $Path -RepositoryRoot $RepositoryRoot
+    $fullPath = Join-Path $RepositoryRoot $normalized
+    if (Test-Path -LiteralPath $fullPath) {
+        return $false
+    }
+
+    $literalPathspec = ":(literal)$normalized"
+    & git -C $RepositoryRoot --no-pager diff --quiet --no-renames --diff-filter=D HEAD -- $literalPathspec
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -eq 1) {
+        return $true
+    }
+    if ($exitCode -ne 0) {
+        throw "Git could not check the deletion status against HEAD for: $normalized"
+    }
+
+    return $false
+}
+
+function Test-SubmitExcludedPathCanBeDeleted {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$RepositoryRoot
+    )
+
+    $normalized = ConvertTo-SubmitRepositoryPath -Path $Path -RepositoryRoot $RepositoryRoot
+    if ($normalized -notin $script:SubmitLocalReportPaths) {
+        return $false
+    }
+
+    return Test-SubmitPathIsTrackedDeletion -Path $normalized -RepositoryRoot $RepositoryRoot
 }
 
 function Test-SubmitPathIsGitIgnored {
@@ -151,8 +193,10 @@ function Get-SubmitCandidatePaths {
     $excludedPaths = @()
     foreach ($path in @($paths | Sort-Object -Unique)) {
         $normalized = ConvertTo-SubmitRepositoryPath -Path $path -RepositoryRoot $RepositoryRoot
-        if ((Test-SubmitPathIsExcluded -Path $normalized) -or
-            (Test-SubmitPathIsGitIgnored -Path $normalized) -or
+        $isExcluded = Test-SubmitPathIsExcluded -Path $normalized
+        $excludedDeletionAllowed = $isExcluded -and (Test-SubmitExcludedPathCanBeDeleted -Path $normalized -RepositoryRoot $RepositoryRoot)
+        if (($isExcluded -and -not $excludedDeletionAllowed) -or
+            ((Test-SubmitPathIsGitIgnored -Path $normalized) -and -not $excludedDeletionAllowed) -or
             (Test-SubmitPathUsesReparsePoint -Path $normalized -RepositoryRoot $RepositoryRoot) -or
             (Test-SubmitFileContainsSecret -Path $normalized -RepositoryRoot $RepositoryRoot)) {
             $excludedPaths += $normalized
@@ -290,7 +334,9 @@ function ConvertFrom-SubmitProposalJson {
     $files = @()
     foreach ($path in @($raw.files)) {
         $normalized = ConvertTo-SubmitRepositoryPath -Path "$path" -RepositoryRoot $RepositoryRoot
-        if (Test-SubmitPathIsExcluded -Path $normalized) {
+        $isExcluded = Test-SubmitPathIsExcluded -Path $normalized
+        $excludedDeletionAllowed = $isExcluded -and (Test-SubmitExcludedPathCanBeDeleted -Path $normalized -RepositoryRoot $RepositoryRoot)
+        if ($isExcluded -and -not $excludedDeletionAllowed) {
             throw "The proposal contains an excluded path: $normalized"
         }
         $key = $normalized.ToLowerInvariant()
@@ -673,21 +719,47 @@ function Get-SubmitStagedPaths {
 }
 
 function Set-SubmitStagingSelection {
-    param([Parameter(Mandatory)][string[]]$SelectedPaths)
+    param(
+        [Parameter(Mandatory)][string[]]$SelectedPaths,
+        [Parameter(Mandatory)][string]$RepositoryRoot
+    )
+
+    $validatedSelectedPaths = foreach ($path in $SelectedPaths) {
+        $normalized = ConvertTo-SubmitRepositoryPath -Path $path -RepositoryRoot $RepositoryRoot
+        $isExcluded = Test-SubmitPathIsExcluded -Path $normalized
+        $excludedDeletionAllowed = $isExcluded -and (Test-SubmitExcludedPathCanBeDeleted -Path $normalized -RepositoryRoot $RepositoryRoot)
+        if ($isExcluded -and -not $excludedDeletionAllowed) {
+            throw "Refusing to stage an excluded path that is not a tracked deletion: $normalized"
+        }
+        if (((Test-SubmitPathIsGitIgnored -Path $normalized) -and -not $excludedDeletionAllowed) -or
+            (Test-SubmitPathUsesReparsePoint -Path $normalized -RepositoryRoot $RepositoryRoot) -or
+            (Test-SubmitFileContainsSecret -Path $normalized -RepositoryRoot $RepositoryRoot)) {
+            throw "Refusing to stage a path that no longer passes Submit safety checks: $normalized"
+        }
+
+        $normalized
+    }
 
     $currentlyStaged = Get-SubmitStagedPaths
     foreach ($path in $currentlyStaged) {
-        if ($SelectedPaths -notcontains $path) {
+        if ($validatedSelectedPaths -notcontains $path) {
             Invoke-Checked -FilePath "git" -Arguments @("--no-pager", "reset", "--", ":(literal)$path") -FailureMessage "Could not unstage an unselected path: $path"
         }
     }
-    foreach ($path in $SelectedPaths) {
+    foreach ($path in $validatedSelectedPaths) {
         Invoke-Checked -FilePath "git" -Arguments @("--no-pager", "add", "--", ":(literal)$path") -FailureMessage "Could not stage the selected path: $path"
     }
 
     $actual = @(Get-SubmitStagedPaths | Sort-Object -Unique)
-    $expected = @($SelectedPaths | Sort-Object -Unique)
+    $expected = @($validatedSelectedPaths | Sort-Object -Unique)
     if (($actual -join "`n") -ne ($expected -join "`n")) {
         throw "The staged file set does not exactly match the accepted Submit proposal."
+    }
+
+    foreach ($path in $validatedSelectedPaths) {
+        if ((Test-SubmitPathIsExcluded -Path $path) -and
+            -not (Test-SubmitExcludedPathCanBeDeleted -Path $path -RepositoryRoot $RepositoryRoot)) {
+            throw "The staged selection contains an excluded path that is not a tracked deletion: $path"
+        }
     }
 }
