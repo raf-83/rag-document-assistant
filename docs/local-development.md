@@ -341,3 +341,83 @@ kubectl rollout status deployment/backend -n rag-document-assistant --timeout=18
 ```
 
 Changing the Kubernetes Secret does not change the password already stored for the PostgreSQL database user.
+
+
+## Local RabbitMQ
+
+RabbitMQ runs as a separate Docker Compose service. The backend does not
+publish processing jobs to it yet.
+
+### Configuration on Windows
+
+Provide `RABBITMQ_USER_DV` and `RABBITMQ_PASSWORD_DV` through environment
+variables or an ignored root `.env` file. Never commit real credentials.
+
+If these variables are saved in the Windows user environment, load them
+into the current PowerShell session:
+
+```powershell
+$env:RABBITMQ_USER_DV = [Environment]::GetEnvironmentVariable('RABBITMQ_USER_DV', 'User')
+$env:RABBITMQ_PASSWORD_DV = [Environment]::GetEnvironmentVariable('RABBITMQ_PASSWORD_DV', 'User')
+```
+
+For a workstation that already uses the application's `_DV` variables,
+map the existing secrets to the names expected by Compose:
+
+```powershell
+$env:DB_PASSWORD = $env:DB_PASSWORD_DV
+$env:JWT_SECRET = $env:JWT_SECRET_DV
+$env:OPENAI_API_KEY = $env:OPENAI_API_KEY_DV
+```
+
+Set `CONFIG_DIR` to the existing external Spring configuration directory
+and `STORAGE_DIR` to the document storage directory. For example:
+
+```powershell
+$env:CONFIG_DIR = 'C:/ai-document-vault-config'
+$env:STORAGE_DIR = 'C:/Projekty/ai-document-vault-storage'
+```
+
+These assignments apply only to the current PowerShell session.
+
+### Start and inspect
+
+Start Docker Desktop before running these commands from the repository root:
+
+```powershell
+docker compose config --quiet
+docker compose up -d --wait rabbitmq
+docker compose ps rabbitmq
+docker compose logs --tail 50 rabbitmq
+```
+
+`config --quiet` validates configuration without printing resolved secrets.
+The service should become `healthy`. Its healthcheck verifies that the
+RabbitMQ application is running; it does not test authentication or message
+delivery. An unhealthy status alone does not restart the container.
+
+Open http://localhost:15672 and sign in with the configured credentials.
+Port 5672 serves AMQP connections; port 15672 serves the management UI.
+Both published ports are bound to the host loopback interface.
+
+### Persistence check
+
+In the management UI, create a Classic queue named
+`adv-11.persistence-check` with Durability set to Durable and Auto delete
+set to No. Recreate the container:
+
+```powershell
+docker compose up -d --force-recreate --wait rabbitmq
+```
+
+Refresh the queue list and verify that the queue still exists.
+This checks persistence of the queue definition, not message persistence.
+
+The `rabbitmq_data` named volume stores broker data outside the container.
+Do not remove the volume or run `docker compose down --volumes` unless
+you intend to delete local data, including the PostgreSQL volume.
+
+The default user and password initialize a new broker database. Changing
+the environment variables does not update an existing user's password.
+
+A single broker with a persistent volume does not provide high availability.
