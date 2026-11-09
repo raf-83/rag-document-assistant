@@ -253,7 +253,7 @@ function Get-ApprovedSubmitProposal {
     }
 }
 function Confirm-Action { param([string]$Operation, [string[]]$Details) throw "Operation cancelled. Enter y or Y to continue." }
-function Set-SubmitStagingSelection { param([string[]]$SelectedPaths) $script:StagingInvocationCount++ }
+function Set-SubmitStagingSelection { param([string[]]$SelectedPaths, [string]$RepositoryRoot) $script:StagingInvocationCount++ }
 $script:InitialPullRequestHeadSha = $newHeadSha
 Reset-TestState -AheadCount 1 -PullRequestResponses @()
 $script:StagingInvocationCount = 0
