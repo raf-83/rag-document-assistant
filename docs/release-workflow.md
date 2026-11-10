@@ -170,3 +170,50 @@ Then open `http://localhost:13000`.
 - [Kubernetes deployment](../infra/k8s/README.md)
 - [Kubernetes Secret management](../infra/k8s/SECRETS.md)
 - [Local development](local-development.md)
+
+
+## Isolated Docker Compose validation
+
+Compose validation uses the shared function in
+`scripts/common/compose-validation.ps1`. The local release workflow calls
+this function, and Backend CI runs its regression suite in a separate
+`Validate Docker Compose` job.
+
+To validate the repository configuration from PowerShell, run from the
+repository root:
+
+```powershell
+& {
+    $ErrorActionPreference = 'Stop'
+    . ./scripts/common/compose-validation.ps1
+    Invoke-IsolatedComposeValidation -RepositoryRoot (Get-Location).Path
+}
+```
+
+The validator supplies non-secret placeholder values only to the Docker
+child process and explicitly selects `compose.yaml` and an empty temporary
+environment file. It ignores inherited Compose file, environment-file,
+project-name, and profile overrides. The caller's environment is preserved,
+and the temporary file is removed in a finally block.
+
+Validation runs `docker compose config --quiet`. It does not start
+containers, test service connectivity, publish images, or deploy anything.
+
+Run the regression suite with:
+
+```powershell
+./scripts/tests/compose-validation-regression.ps1
+```
+
+The suite checks the actual Compose configuration without private secrets,
+ignores a malformed local `.env`, verifies preservation of the caller's
+environment, and confirms rejection of a missing required variable and
+invalid YAML. Docker Compose errors in the rejection scenarios are expected;
+the final success message is:
+
+`All Compose validation regression tests passed.`
+
+Backend CI runs both backend tests and Compose validation for Pull Requests
+to main and pushes to main. Both jobs must succeed for the workflow to
+succeed. Local regression success does not replace checking the actual
+GitHub Actions run.

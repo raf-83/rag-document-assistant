@@ -38,3 +38,15 @@ jobs:
 
       - name: Run unit tests
         run: ./mvnw -B test
+
+  compose-validation:
+    name: Validate Docker Compose
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate Compose and run regression tests
+        shell: pwsh
+        run: ./scripts/tests/compose-validation-regression.ps1

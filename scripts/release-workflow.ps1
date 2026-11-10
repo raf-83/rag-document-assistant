@@ -204,39 +204,8 @@ function Invoke-SecretPatternCheck {
 }
 
 function Invoke-ComposeValidation {
-    Write-Step "Validating Docker Compose configuration with non-secret placeholders"
-
-    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = "docker"
-    $startInfo.Arguments = "compose config --quiet"
-    $startInfo.WorkingDirectory = $script:RepositoryRoot
-    $startInfo.UseShellExecute = $false
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $startInfo.EnvironmentVariables["DB_PASSWORD"] = "validation-placeholder"
-    $startInfo.EnvironmentVariables["OPENAI_API_KEY"] = "validation-placeholder"
-    $startInfo.EnvironmentVariables["JWT_SECRET"] = "validation-placeholder-validation-placeholder"
-    $startInfo.EnvironmentVariables["CONFIG_DIR"] = "C:\tmp\rag-config"
-    $startInfo.EnvironmentVariables["STORAGE_DIR"] = "C:\tmp\rag-storage"
-
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $startInfo
-    [void]$process.Start()
-    $standardOutput = $process.StandardOutput.ReadToEnd()
-    $standardError = $process.StandardError.ReadToEnd()
-    $process.WaitForExit()
-
-    if ($process.ExitCode -ne 0) {
-        if (-not [string]::IsNullOrWhiteSpace($standardOutput)) {
-            Write-Host $standardOutput
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($standardError)) {
-            Write-Host $standardError
-        }
-
-        throw "Docker Compose configuration is invalid."
-    }
+    . (Join-Path $script:RepositoryRoot "scripts/common/compose-validation.ps1")
+    Invoke-IsolatedComposeValidation -RepositoryRoot $script:RepositoryRoot
 }
 
 function Invoke-Actionlint {
