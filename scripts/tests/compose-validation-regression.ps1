@@ -70,28 +70,22 @@ try {
     $env:COMPOSE_PROJECT_NAME = 'INVALID PROJECT NAME!'
     $env:COMPOSE_PROFILES = 'unused-profile'
 
+    $expectedEnvironment = @{}
+
+    foreach ($name in $variableNames) {
+        $expectedEnvironment[$name] =
+            [Environment]::GetEnvironmentVariable($name, 'Process')
+    }
+
     Invoke-IsolatedComposeValidation -RepositoryRoot $testRoot
     Write-Host 'PASS: actual Compose validates without private secrets or .env.'
 
-    foreach ($name in @(
-        'DB_PASSWORD',
-        'OPENAI_API_KEY',
-        'JWT_SECRET',
-        'RABBITMQ_USER_DV',
-        'RABBITMQ_PASSWORD_DV',
-        'CONFIG_DIR',
-        'STORAGE_DIR'
-    )) {
-        if ($null -ne [Environment]::GetEnvironmentVariable($name, 'Process')) {
+    foreach ($name in $variableNames) {
+        $actualValue = [Environment]::GetEnvironmentVariable($name, 'Process')
+
+        if (-not [object]::Equals($expectedEnvironment[$name], $actualValue)) {
             throw "Validator changed the parent environment: $name"
         }
-    }
-
-    if ($env:COMPOSE_FILE -ne 'missing-compose.yaml' -or
-        $env:COMPOSE_ENV_FILES -ne 'missing-environment.env' -or
-        $env:COMPOSE_PROJECT_NAME -ne 'INVALID PROJECT NAME!' -or
-        $env:COMPOSE_PROFILES -ne 'unused-profile') {
-        throw 'Validator changed inherited Compose overrides in the parent.'
     }
 
     Write-Host 'PASS: parent environment preserved.'
