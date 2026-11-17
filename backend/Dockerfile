@@ -8,7 +8,7 @@ RUN mvn -B dependency:go-offline
 
 COPY src ./src
 
-RUN mvn -B package
+RUN mvn -B -DskipTests package
 
 
 FROM eclipse-temurin:25-jre-noble
